@@ -78,7 +78,7 @@
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.0.0",
-    "@types/node": "^20.19.0",
+    "@types/node": "^26.1.2",
     "tsup": "^8.5.0",
     "typescript": "^5.9.0",
     "vitest": "2.1.9"
