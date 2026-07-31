@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same ref when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-check:
+    name: Build & verify (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The exact minimum declared engine floor plus the current maintained
+        # LTS line, so minimum-Node behavior is reproducibly exercised.
+        node: ["20.0.0", "22"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run check
+
+      - name: Committed-artifact drift check
+        # This must run before any command that rewrites dist.
+        run: npm run check:artifact
+
+      - name: Tests
+        run: npm test
+
+      - name: Packaging gate
+        # Marketplace smoke of committed dist + npm pack inventory/entrypoints.
+        run: npm run test:package
+
+      - name: Build
+        run: npm run build

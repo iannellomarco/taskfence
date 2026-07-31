@@ -1,0 +1,66 @@
+name: Bug report
+description: Report reproducible incorrect behavior in TaskFence
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities here. Use the repository's private Security Advisory flow described in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: TaskFence version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Runtime
+      options:
+        - Claude Code
+        - Codex CLI
+        - OpenCode
+        - OMP
+        - Pi
+        - Standalone CLI or library
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Host runtime version, Node version, operating system, and installation scope.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the contract, command or hook event, and exact sequence. Remove secrets and private content.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: Include redacted status, doctor, or receipt-verification output when relevant.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I reproduced this with the latest TaskFence release.
+          required: true
+        - label: I removed credentials, meeting data, source contents, and other sensitive information.
+          required: true
