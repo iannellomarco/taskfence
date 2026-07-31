@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 1280 640"
+     width="1280"
+     height="640"
+     role="img"
+     aria-labelledby="title desc">
+  <title id="title">TaskFence — deterministic guardrails for coding agents</title>
+  <desc id="desc">GitHub social preview for TaskFence. Contract, checkpoint, enforce, and roll back.</desc>
+
+  <defs>
+    <!-- Original single-line letter geometry: TASKFENCE. -->
+    <path id="taskfence-letters"
+          d="M0 0H34M17 0V52
+             M48 52L58 0H72L82 52M54 31H76
+             M130 0H102L96 6V22H124L130 28V46L124 52H96
+             M144 0V52M178 0L144 31M158 18L178 52
+             M192 52V0H226M192 25H219
+             M274 0H240V52H274M240 26H267
+             M288 52V0L322 52V0
+             M370 0H342L336 6V46L342 52H370
+             M418 0H384V52H418M384 26H411"/>
+  </defs>
+
+  <rect width="1280" height="640" fill="#17233A"/>
+  <rect x="40" y="40" width="1200" height="560"
+        fill="none"
+        stroke="#657BA7"
+        stroke-width="2"/>
+
+  <!-- Compact mark and custom vector wordmark. -->
+  <g transform="translate(88 72) scale(1.375)">
+    <path d="M8 8H56V24H48V16H16V48H48V40H56V56H8Z"
+          fill="#F3F0E7"
+          stroke="#17233A"
+          stroke-width="2.5"
+          stroke-linejoin="miter"/>
+    <path d="M21 34L30 43L53 28"
+          fill="none"
+          stroke="#17233A"
+          stroke-width="9"
+          stroke-linecap="square"
+          stroke-linejoin="miter"/>
+    <path d="M21 34L30 43L53 28"
+          fill="none"
+          stroke="#F06B4F"
+          stroke-width="5"
+          stroke-linecap="square"
+          stroke-linejoin="miter"/>
+  </g>
+
+  <g transform="translate(198 91) scale(1.05)"
+     fill="none"
+     stroke-linecap="square"
+     stroke-linejoin="miter">
+    <use href="#taskfence-letters"
+         stroke="#10192B"
+         stroke-width="10"/>
+    <use href="#taskfence-letters"
+         stroke="#F3F0E7"
+         stroke-width="6"/>
+  </g>
+
+  <path d="M88 198H254"
+        fill="none"
+        stroke="#F06B4F"
+        stroke-width="5"/>
+  <path d="M254 198H1192"
+        fill="none"
+        stroke="#657BA7"
+        stroke-width="2"/>
+
+  <!-- Standard local system stack keeps the descriptive copy portable and selectable. -->
+  <text x="88" y="310"
+        fill="#F3F0E7"
+        font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="64"
+        font-weight="650"
+        letter-spacing="-1">
+    <tspan x="88" dy="0">Deterministic guardrails</tspan>
+    <tspan x="88" dy="78">for coding agents</tspan>
+  </text>
+
+  <text x="88" y="520"
+        fill="#C8D0DC"
+        font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="28"
+        font-weight="500"
+        letter-spacing="0.5">Contract • Checkpoint • Enforce • Roll back</text>
+</svg>

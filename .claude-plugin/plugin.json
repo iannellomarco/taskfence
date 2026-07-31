@@ -1,0 +1,10 @@
+{
+  "name": "taskfence",
+  "version": "0.1.0",
+  "description": "Deterministic application-hook policy enforcement for Claude Code tool calls",
+  "author": {
+    "name": "Marco Iannello"
+  },
+  "hooks": "./hooks/hooks.json",
+  "commands": "./commands"
+}

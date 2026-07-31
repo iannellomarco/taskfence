@@ -1,0 +1,37 @@
+{
+  "description": "TaskFence deterministic pre-tool enforcement and post-tool reconciliation",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/dist/cli.js",
+              "hook",
+              "claude"
+            ]
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/dist/cli.js",
+              "hook",
+              "claude"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

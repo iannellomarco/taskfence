@@ -1,0 +1,31 @@
+{
+  "description": "TaskFence Codex CLI 0.146.0 hook template. Before installing, replace /ABSOLUTE/PATH/TO/NODE and /ABSOLUTE/PATH/TO/TASKFENCE with real absolute paths; the command must remain absolute because Codex runs hooks from the session cwd.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/ABSOLUTE/PATH/TO/NODE\" \"/ABSOLUTE/PATH/TO/TASKFENCE/dist/cli.js\" hook codex",
+            "timeout": 30,
+            "statusMessage": "Checking TaskFence policy"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/ABSOLUTE/PATH/TO/NODE\" \"/ABSOLUTE/PATH/TO/TASKFENCE/dist/cli.js\" hook codex",
+            "timeout": 30,
+            "statusMessage": "Reconciling TaskFence mutation"
+          }
+        ]
+      }
+    ]
+  }
+}

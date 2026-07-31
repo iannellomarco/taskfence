@@ -1,0 +1,86 @@
+{
+  "name": "taskfence",
+  "version": "0.1.0",
+  "description": "Deterministic, hook-enforced task contracts for coding agents",
+  "license": "MIT",
+  "author": "Marco Iannello",
+  "keywords": [
+    "coding-agent",
+    "ai-agent",
+    "guardrails",
+    "policy-enforcement",
+    "claude-code",
+    "codex",
+    "opencode",
+    "omp",
+    "pi"
+  ],
+  "homepage": "https://github.com/iannellomarco/taskfence#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iannellomarco/taskfence.git"
+  },
+  "bugs": {
+    "url": "https://github.com/iannellomarco/taskfence/issues"
+  },
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "taskfence": "dist/cli.js",
+    "tf": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./adapters/claude-code": {
+      "types": "./dist/adapters/claude-code.d.ts",
+      "import": "./dist/adapters/claude-code.js"
+    },
+    "./adapters/codex-cli": {
+      "types": "./dist/adapters/codex-cli.d.ts",
+      "import": "./dist/adapters/codex-cli.js"
+    },
+    "./adapters/opencode": {
+      "types": "./dist/adapters/opencode.d.ts",
+      "import": "./dist/adapters/opencode.js"
+    },
+    "./adapters/omp": {
+      "types": "./dist/adapters/omp.d.ts",
+      "import": "./dist/adapters/omp.js"
+    },
+    "./adapters/pi": {
+      "types": "./dist/adapters/pi.d.ts",
+      "import": "./dist/adapters/pi.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:package": "vitest run test/packaging.test.ts",
+    "check:artifact": "node scripts/check-artifact-drift.mjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.0.0",
+    "@types/node": "^20.19.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.0",
+    "vitest": "2.1.9"
+  }
+}

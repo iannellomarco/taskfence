@@ -1,0 +1,14 @@
+{
+  "name": "taskfence",
+  "owner": {
+    "name": "Marco Iannello"
+  },
+  "plugins": [
+    {
+      "name": "taskfence",
+      "source": "./",
+      "description": "Deterministic application-hook policy enforcement for Claude Code tool calls",
+      "version": "0.1.0"
+    }
+  ]
+}
