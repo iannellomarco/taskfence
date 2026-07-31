@@ -44,9 +44,9 @@ flowchart LR
   C --> D[Active contract and bound host session]
   D --> E[Pre-tool authorization and correlation]
   E --> F[Mutation executes]
-  F --> G[Post-tool compare and receipt]
-  G -->|matches| D
-  G -->|unexpected drift| H[Recovery required]
+  F --> G[Post-tool correlation and receipt]
+  G -->|reported success| D
+  G -->|failure or observed violation| H[Fail-closed recovery state]
   H --> I[Rollback]
   I --> J[Checkpoint restored; root .git preserved]
 ```
