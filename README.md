@@ -45,7 +45,7 @@ When Claude Code asks for an installation scope, choose **Local** for your first
 The plugin runs its hooks from the bundled artifact. Claude Code's direct `!` shell does not inherit plugin executables on `PATH`, so install the matching CLI once for the user-only status, completion, and rollback commands below:
 
 ```text
-!npm install --global github:iannellomarco/taskfence#v0.1.0
+!npm install --global https://github.com/iannellomarco/taskfence/archive/refs/tags/v0.1.0.tar.gz
 !taskfence status --root .
 ```
 
