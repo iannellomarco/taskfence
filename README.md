@@ -27,7 +27,7 @@ You do not need to write the contract yourself. The included setup skill prepare
 - Claude Code with plugin support
 - Node.js 20 or newer (`node --version` shows your installed version)
 - macOS or Linux
-- Claude Code's default plan directory; custom `plansDirectory` settings are not supported in TaskFence 0.1.1
+- Claude Code's default plan directory; custom `plansDirectory` settings are not supported in TaskFence 0.1.2
 
 ### 1. Add and install the plugin
 
@@ -46,7 +46,7 @@ When Claude Code asks for an installation scope, choose **Local** for your first
 The plugin runs its hooks from the bundled artifact. Claude Code's direct `!` shell does not inherit plugin executables on `PATH`, so install the matching CLI once for the user-only status, completion, and rollback commands below:
 
 ```text
-!npm install --global https://github.com/iannellomarco/taskfence/archive/refs/tags/v0.1.1.tar.gz
+!npm install --global https://github.com/iannellomarco/taskfence/archive/refs/tags/v0.1.2.tar.gz
 !taskfence status --root .
 ```
 

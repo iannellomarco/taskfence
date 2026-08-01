@@ -1,7 +1,7 @@
 {
   "name": "taskfence",
   "displayName": "TaskFence",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Deterministic, hook-enforced task contracts for Claude Code coding agents",
   "author": {
     "name": "Marco Iannello"
@@ -16,6 +16,5 @@
     "policy-enforcement",
     "task-contracts"
   ],
-  "skills": "./skills",
-  "hooks": "./hooks/hooks.json"
+  "skills": "./skills"
 }

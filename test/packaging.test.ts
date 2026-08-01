@@ -93,7 +93,7 @@ describe("marketplace plugin entrypoint (committed artifacts)", () => {
     ) as {
       version?: string;
       skills?: string;
-      hooks?: string;
+      hooks?: unknown;
     };
     const marketplaceManifest = JSON.parse(
       await readFile(MARKETPLACE_MANIFEST_PATH, "utf8"),
@@ -103,10 +103,10 @@ describe("marketplace plugin entrypoint (committed artifacts)", () => {
     expect(pluginManifest.version).toBe(packageManifest.version);
     expect(marketplaceManifest.plugins?.[0]?.version).toBe(packageManifest.version);
 
-    for (const componentPath of [pluginManifest.skills, pluginManifest.hooks]) {
-      expect(typeof componentPath).toBe("string");
-      await stat(resolve(REPOSITORY_ROOT, componentPath as string));
-    }
+    expect(pluginManifest.hooks).toBeUndefined();
+    expect(typeof pluginManifest.skills).toBe("string");
+    await stat(resolve(REPOSITORY_ROOT, pluginManifest.skills as string));
+    await stat(HOOKS_MANIFEST_PATH);
 
     const hookManifest = JSON.parse(
       await readFile(HOOKS_MANIFEST_PATH, "utf8"),

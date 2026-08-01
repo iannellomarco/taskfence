@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
-import { lstat, realpath, unlink } from "node:fs/promises";
+import { constants as fsConstants, type Stats } from "node:fs";
+import { lstat, open, realpath, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { compileContract } from "../contract/compile.js";
 import {
+  MAX_PLAN_BYTES,
   readBoundedPlanFile,
   requireBoundedPlanText,
 } from "../contract/limits.js";
@@ -58,6 +59,7 @@ const MAX_PATH_LENGTH = 65_536;
 const MAX_SHORT_FIELD_LENGTH = 1_024;
 const CLAUDE_APPROVAL_FILE_MODE = 0o600;
 const MAX_CLAUDE_APPROVAL_BYTES = 16 * 1024;
+const CLAUDE_PLAN_BINDING_CALL_ID = "plan-binding-v1";
 const CLAUDE_APPROVAL_KEYS = [
   "callId",
   "planHash",
@@ -354,7 +356,6 @@ function claudePlanPath(value: unknown): string | undefined {
 
 async function claudePlanWritePath(
   payload: ClaudeToolHookPayload,
-  requireFresh: boolean,
 ): Promise<string | undefined> {
   if (
     payload.agentId !== undefined ||
@@ -384,15 +385,6 @@ async function claudePlanWritePath(
     return undefined;
   }
   if (isContainedPath(canonicalRoot, canonicalPlansDirectory)) return undefined;
-
-  if (requireFresh) {
-    try {
-      await lstat(planPath);
-      return undefined;
-    } catch (error) {
-      if (!isNodeError(error, "ENOENT")) return undefined;
-    }
-  }
   return planPath;
 }
 
@@ -424,6 +416,22 @@ async function claudePlanWriteLocation(
     .digest("hex");
   return {
     path: join(layout.projectDir, `.claude-plan-write-${key}.json`),
+    projectDirectory: layout.projectDir,
+    root: layout.canonicalRoot,
+  };
+}
+
+async function claudePlanBindingLocation(
+  payload: ClaudeToolHookPayload,
+): Promise<ClaudeCorrelationLocation> {
+  const layout = await stateLayout(payload.cwd);
+  const key = createHash("sha256")
+    .update("plan-binding", "utf8")
+    .update("\0", "utf8")
+    .update(payload.sessionId, "utf8")
+    .digest("hex");
+  return {
+    path: join(layout.projectDir, `.claude-plan-binding-${key}.json`),
     projectDirectory: layout.projectDir,
     root: layout.canonicalRoot,
   };
@@ -608,6 +616,179 @@ async function verifyClaudeApproval(
   }
 }
 
+function planBindingPayload(
+  payload: ClaudeToolHookPayload,
+): ClaudeToolHookPayload {
+  return { ...payload, toolUseId: CLAUDE_PLAN_BINDING_CALL_ID };
+}
+
+function planPathHash(planPath: string): string {
+  return createHash("sha256").update(planPath, "utf8").digest("hex");
+}
+
+function validateClaudePlanMetadata(
+  planPath: string,
+  metadata: Stats,
+): void {
+  if (
+    !metadata.isFile() ||
+    metadata.nlink !== 1 ||
+    metadata.size < 0 ||
+    metadata.size > MAX_PLAN_BYTES ||
+    (metadata.mode & 0o022) !== 0 ||
+    (typeof process.getuid === "function" &&
+      metadata.uid !== process.getuid())
+  ) {
+    throw new ClaudeHookInputError(
+      `Claude's native plan must be a current-user regular file with one link, no group or other write access, and at most ${MAX_PLAN_BYTES} bytes: ${planPath}`,
+    );
+  }
+}
+
+async function validateBoundClaudePlanFile(planPath: string): Promise<void> {
+  const handle = await open(
+    planPath,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+  );
+  try {
+    validateClaudePlanMetadata(planPath, await handle.stat());
+  } finally {
+    await handle.close();
+  }
+}
+
+async function syncClaudePlansDirectory(planPath: string): Promise<void> {
+  const canonicalDirectory = await realpath(dirname(planPath));
+  const handle = await open(
+    canonicalDirectory,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+  );
+  try {
+    const metadata = await handle.stat();
+    if (
+      !metadata.isDirectory() ||
+      (metadata.mode & 0o022) !== 0 ||
+      (typeof process.getuid === "function" &&
+        metadata.uid !== process.getuid())
+    ) {
+      throw new ClaudeHookInputError(
+        `Claude's plans directory is not safely owned: ${canonicalDirectory}`,
+      );
+    }
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function verifyClaudePlanBinding(
+  payload: ClaudeToolHookPayload,
+  planPath: string,
+): Promise<void> {
+  const location = await claudePlanBindingLocation(payload);
+  await verifyClaudeApproval(
+    location,
+    planBindingPayload(payload),
+    planPathHash(planPath),
+    "Claude's native plan path is not bound to this root session",
+  );
+  await validateBoundClaudePlanFile(planPath);
+}
+
+async function reserveClaudePlanPath(
+  payload: ClaudeToolHookPayload,
+  planPath: string,
+): Promise<void> {
+  const location = await claudePlanBindingLocation(payload);
+  try {
+    await lstat(location.path);
+    await verifyClaudePlanBinding(payload, planPath);
+    return;
+  } catch (error) {
+    if (!isNodeError(error, "ENOENT")) throw error;
+  }
+
+  try {
+    await lstat(planPath);
+    throw new ClaudeHookInputError(
+      "Claude's native plan path must be a fresh file before it is bound to this session",
+    );
+  } catch (error) {
+    if (!isNodeError(error, "ENOENT")) throw error;
+  }
+
+  const requirements = {
+    mode: CLAUDE_APPROVAL_FILE_MODE,
+    maxBytes: MAX_PLAN_BYTES,
+    label: "Claude native plan reservation",
+  };
+  const created = await createSecureFile(
+    planPath,
+    fsConstants.O_WRONLY,
+    requirements,
+  );
+  let closed = false;
+  try {
+    await created.handle.sync();
+    await created.handle.close();
+    closed = true;
+    await syncClaudePlansDirectory(planPath);
+    await stageClaudeApproval(
+      location,
+      planBindingPayload(payload),
+      planPathHash(planPath),
+    );
+  } catch (error) {
+    if (!closed) await created.handle.close().catch(() => undefined);
+    await unlink(planPath).catch(() => undefined);
+    await syncClaudePlansDirectory(planPath).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function boundClaudePlanFileIsEmpty(planPath: string): Promise<boolean> {
+  const handle = await open(
+    planPath,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+  );
+  try {
+    const metadata = await handle.stat();
+    validateClaudePlanMetadata(planPath, metadata);
+    return metadata.size === 0;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function stageClaudePlanWrite(
+  location: ClaudeCorrelationLocation,
+  payload: ClaudeToolHookPayload,
+  planPath: string,
+  planHash: string,
+): Promise<void> {
+  try {
+    await stageClaudeApproval(location, payload, planHash);
+    return;
+  } catch (error) {
+    let existing: ClaudeApprovalRecord;
+    try {
+      existing = await readClaudeApprovalRecord(location.path);
+    } catch {
+      throw error;
+    }
+    if (
+      existing.root !== location.root ||
+      existing.sessionId !== payload.sessionId ||
+      !(await boundClaudePlanFileIsEmpty(planPath))
+    ) {
+      throw error;
+    }
+  }
+
+  await removeClaudeCorrelation(location);
+  await stageClaudeApproval(location, payload, planHash);
+}
+
 async function removeClaudeCorrelation(
   location: ClaudeCorrelationLocation,
 ): Promise<void> {
@@ -636,14 +817,16 @@ async function claudeApprovalIsAlreadyActive(
 async function runPreToolUse(
   payload: ClaudeToolHookPayload,
 ): Promise<HookExecutionResult> {
-  const planWritePath = await claudePlanWritePath(payload, true);
+  const planWritePath = await claudePlanWritePath(payload);
   if (planWritePath !== undefined) {
     try {
       const content = requirePlan(payload.toolInput, "content");
+      await reserveClaudePlanPath(payload, planWritePath);
       const location = await claudePlanWriteLocation(payload, planWritePath);
-      await stageClaudeApproval(
+      await stageClaudePlanWrite(
         location,
         payload,
+        planWritePath,
         createHash("sha256").update(content, "utf8").digest("hex"),
       );
     } catch (error) {
@@ -661,7 +844,7 @@ async function runPreToolUse(
   ) {
     return structuredDecision(
       "deny",
-      "Claude's native plan must use a fresh file in the default plans directory; custom plansDirectory paths and existing files are unsupported",
+      "Claude's native plan must use a session-bound file in the default plans directory; custom plansDirectory paths are unsupported",
     );
   }
 
@@ -676,7 +859,25 @@ async function runPreToolUse(
     let planHash: string;
     try {
       plan = requirePlan(payload.toolInput, "plan");
-      optionalString(payload.toolInput, "planFilePath", MAX_PATH_LENGTH);
+      const planFilePath = optionalString(
+        payload.toolInput,
+        "planFilePath",
+        MAX_PATH_LENGTH,
+      );
+      if (planFilePath !== undefined) {
+        const boundPlanPath = claudePlanPath(planFilePath);
+        if (boundPlanPath === undefined) {
+          throw new ClaudeHookInputError(
+            "ExitPlanMode returned an invalid Claude plan file path",
+          );
+        }
+        await verifyClaudePlanBinding(payload, boundPlanPath);
+        if (await readBoundedPlanFile(boundPlanPath) !== plan) {
+          throw new ClaudeHookInputError(
+            "ExitPlanMode plan does not match its session-bound plan file",
+          );
+        }
+      }
       if (
         payload.toolInput.allowedPrompts !== undefined &&
         !Array.isArray(payload.toolInput.allowedPrompts)
@@ -716,9 +917,10 @@ async function runPostToolUse(
   if (payload.toolResponse === undefined) {
     throw new ClaudeHookInputError("PostToolUse requires tool_response");
   }
-  const planWritePath = await claudePlanWritePath(payload, false);
+  const planWritePath = await claudePlanWritePath(payload);
   if (planWritePath !== undefined) {
     const expectedPlan = requirePlan(payload.toolInput, "content");
+    await verifyClaudePlanBinding(payload, planWritePath);
     const reservation = await claudePlanWriteLocation(payload, planWritePath);
     await verifyClaudeApproval(
       reservation,
@@ -783,6 +985,7 @@ async function runPostToolUse(
         }
         approvedPlan = inputPlan;
       } else {
+        await verifyClaudePlanBinding(payload, planPath);
         try {
           approvedPlan = await readBoundedPlanFile(planPath);
         } catch (error) {

@@ -322,7 +322,35 @@ describe("Claude Code adapter", () => {
     const approvedPlan = contractPlan();
     const substitutedPlan = approvedPlan.replace("tracked.txt", "outside.txt");
     const planPath = join(claudePlansDirectory, "substituted-plan.md");
+    const planWriteInput = {
+      file_path: planPath,
+      content: substitutedPlan,
+    };
+    const planWritePre = claudePayload(
+      "PreToolUse",
+      "Write",
+      planWriteInput,
+      "claude-substitution-plan-write",
+    );
+    planWritePre.permission_mode = "plan";
+    expect(await runClaudeHook(planWritePre)).toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
     await writeFile(planPath, substitutedPlan);
+    expect(
+      await runClaudeHook({
+        ...claudePayload(
+          "PostToolUse",
+          "Write",
+          planWriteInput,
+          "claude-substitution-plan-write",
+        ),
+        permission_mode: "plan",
+        tool_response: { filePath: planPath },
+      }),
+    ).toEqual({ exitCode: 0, stdout: "", stderr: "" });
 
     const pre = await runClaudeHook(
       claudePayload(
@@ -465,10 +493,44 @@ describe("Claude Code adapter", () => {
       "claude-conflicting-plan-reservation",
     );
     conflictingReservation.permission_mode = "plan";
-    const conflict = await runClaudeHook(conflictingReservation);
-    expect(parsedStdout(conflict)).toMatchObject({
+    expect(await runClaudeHook(conflictingReservation)).toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+
+    await writeFile(reservedPlanPath, contractPlan());
+    expect(
+      await runClaudeHook({
+        ...claudePayload(
+          "PostToolUse",
+          "Write",
+          {
+            file_path: reservedPlanPath,
+            content: contractPlan(),
+          },
+          "claude-conflicting-plan-reservation",
+        ),
+        permission_mode: "plan",
+        tool_response: { filePath: reservedPlanPath },
+      }),
+    ).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+
+    const otherSession = claudePayload(
+      "PreToolUse",
+      "Write",
+      {
+        file_path: reservedPlanPath,
+        content: contractPlan(),
+      },
+      "claude-other-session-plan-write",
+    );
+    otherSession.session_id = "other-root-session";
+    otherSession.permission_mode = "plan";
+    expect(parsedStdout(await runClaudeHook(otherSession))).toMatchObject({
       hookSpecificOutput: {
         permissionDecision: "deny",
+        permissionDecisionReason: expect.stringMatching(/fresh file/u),
       },
     });
 

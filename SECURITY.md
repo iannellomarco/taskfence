@@ -66,10 +66,11 @@ hook boundary of a supported coding agent. Within that boundary it provides:
 - **Read-only tolerance**: when no contract is active, read-only tool calls are
   allowed and project mutations/commands are denied. The Claude Code adapter
   has one pre-engine exception: while the host reports Plan Mode, it defers only
-  Claude Code's bounded native plan-file write to the host's own gate, and only
-  when its directory and destination resolve safely outside the project. That
-  write grants no project authority. Project mutations and commands require an
-  active contract and bound host authority.
+  Claude Code's bounded native plan-file write to the host's own gate. The first
+  destination is created exclusively and bound to the root host session; later
+  writes must reuse that binding, and the safe default plans directory must
+  resolve outside the project. That write grants no project authority. Project
+  mutations and commands require an active contract and bound host authority.
 - **Checkpoint before activation**: before a contract becomes active, a
   checkpoint of the project tree is staged and committed so the work can be
   rolled back.

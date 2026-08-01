@@ -385,7 +385,6 @@ describe("session authority", () => {
     const contractPlan = plan();
     const toolInput = {
       plan: contractPlan,
-      planFilePath: join(projectRoot, "plan.md"),
       allowedPrompts: [],
     };
     const toolUseId = "claude-exit-plan";
@@ -415,7 +414,7 @@ describe("session authority", () => {
           "ExitPlanMode",
           toolInput,
           toolUseId,
-          { plan: contractPlan, filePath: join(projectRoot, "plan.md") },
+          { plan: contractPlan },
         ),
       ),
     ).resolves.toEqual({ exitCode: 0, stdout: "", stderr: "" });

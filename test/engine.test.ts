@@ -36,6 +36,7 @@ import {
   type PreToolCallInput,
   type PreToolCallResult,
 } from "../src/index.js";
+import { __setApprovalFaultHooks } from "../src/engine.js";
 
 let sandbox: string;
 let stateDirectory: string;
@@ -49,6 +50,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  __setApprovalFaultHooks(null);
   if (previousStateDirectory === undefined) delete process.env.TASKFENCE_STATE_DIR;
   else process.env.TASKFENCE_STATE_DIR = previousStateDirectory;
   await rm(sandbox, { recursive: true, force: true });
@@ -154,6 +156,142 @@ describe("engine activation and authorization", () => {
     expect(active.checkpoint).not.toBeNull();
     expect(active.checkpoint?.entries.map((entry) => entry.path)).toContain("src/allowed.txt");
     expect((await getStatus(root)).checkpoint?.hash).toBe(active.checkpoint?.hash);
+  });
+
+  it("resumes approval after a crash with the staged state already durable", async () => {
+    const root = await createWorktree("approval-staged-resume");
+    __setApprovalFaultHooks({
+      afterStage: () => {
+        throw new Error("simulated process exit after staging");
+      },
+    });
+
+    await expect(approvePlan(plan(), root)).rejects.toThrow(
+      "simulated process exit after staging",
+    );
+    expect(await getStatus(root)).toMatchObject({
+      status: "staged",
+      revision: 1,
+    });
+
+    __setApprovalFaultHooks(null);
+    const active = await approvePlan(plan(), root);
+    expect(active).toMatchObject({ status: "active", revision: 1 });
+    expect(active.checkpoint).not.toBeNull();
+
+    const receiptCount = (await readReceipts(root)).length;
+    const repeated = await approvePlan(plan(), root);
+    expect(repeated).toEqual(active);
+    expect(await readReceipts(root)).toHaveLength(receiptCount);
+    expect((await verifyReceiptLedger(root)).valid).toBe(true);
+  });
+
+  it("resumes approval after a crash with checkpointing already durable", async () => {
+    const root = await createWorktree("approval-checkpointing-resume");
+    __setApprovalFaultHooks({
+      afterCheckpointing: () => {
+        throw new Error("simulated process exit before checkpoint creation");
+      },
+    });
+
+    await expect(approvePlan(plan(), root)).rejects.toThrow(
+      "simulated process exit before checkpoint creation",
+    );
+    expect(await getStatus(root)).toMatchObject({
+      status: "checkpointing",
+      revision: 1,
+    });
+
+    __setApprovalFaultHooks(null);
+    const active = await approvePlan(plan(), root);
+    expect(active).toMatchObject({ status: "active", revision: 1 });
+    expect(active.checkpoint).not.toBeNull();
+    expect((await verifyReceiptLedger(root)).valid).toBe(true);
+  });
+
+  it("does not let another trusted identity resume checkpointing approval", async () => {
+    const root = await createWorktree("approval-identity-resume");
+    const owner = { runtime: "claude" as const, sessionId: "approval-owner" };
+    __setApprovalFaultHooks({
+      afterCheckpointing: () => {
+        throw new Error("simulated owner exit during approval");
+      },
+    });
+
+    await expect(approvePlan(plan(), root, owner)).rejects.toThrow(
+      "simulated owner exit during approval",
+    );
+    __setApprovalFaultHooks(null);
+    await expect(
+      approvePlan(plan(), root, {
+        runtime: "claude",
+        sessionId: "approval-other",
+      }),
+    ).rejects.toThrow(/identity does not match the checkpointing contract/iu);
+
+    const active = await approvePlan(plan(), root, owner);
+    expect(active).toMatchObject({
+      status: "active",
+      authority: {
+        runtime: "claude",
+        rootSessionId: owner.sessionId,
+      },
+    });
+  });
+
+  it("converges concurrent approvals of the same contract", async () => {
+    const root = await createWorktree("approval-concurrent");
+    const [first, second] = await Promise.all([
+      approvePlan(plan(), root),
+      approvePlan(plan(), root),
+    ]);
+
+    expect(first).toEqual(second);
+    expect(first).toMatchObject({ status: "active", revision: 1 });
+    expect(first.checkpoint).not.toBeNull();
+    expect((await verifyReceiptLedger(root)).valid).toBe(true);
+  });
+
+  it("rejects a stale checkpoint after the same approval is revoked and restarted", async () => {
+    const root = await createWorktree("approval-checkpoint-aba");
+    let markCheckpointReady!: () => void;
+    let releaseOldCheckpoint!: () => void;
+    const checkpointReady = new Promise<void>((resolve) => {
+      markCheckpointReady = resolve;
+    });
+    const holdOldCheckpoint = new Promise<void>((resolve) => {
+      releaseOldCheckpoint = resolve;
+    });
+    let oldCheckpointHash: string | undefined;
+    __setApprovalFaultHooks({
+      afterCheckpointCreated: async (checkpoint) => {
+        oldCheckpointHash = checkpoint.hash;
+        markCheckpointReady();
+        await holdOldCheckpoint;
+      },
+    });
+
+    const oldApproval = approvePlan(plan(), root);
+    const oldRejection = expect(oldApproval).rejects.toThrow(
+      /checkpoint success cannot be applied because approval state changed/iu,
+    );
+    await checkpointReady;
+    __setApprovalFaultHooks(null);
+
+    await revokePlan(root, "superseded checkpointing attempt");
+    await writeFile(path.join(root, "src", "allowed.txt"), "replacement baseline");
+    const replacement = await approvePlan(plan(), root);
+    expect(replacement.checkpoint?.hash).not.toBe(oldCheckpointHash);
+
+    releaseOldCheckpoint();
+    await oldRejection;
+    expect(await getStatus(root)).toEqual(replacement);
+
+    await writeFile(path.join(root, "src", "allowed.txt"), "later drift");
+    await rollbackPlan(root);
+    expect(
+      await readFile(path.join(root, "src", "allowed.txt"), "utf8"),
+    ).toBe("replacement baseline");
   });
 
   it("enforces read, create, write, delete, protected-path, path, command, and identity decisions", async () => {

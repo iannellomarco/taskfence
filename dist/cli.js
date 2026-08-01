@@ -21523,6 +21523,7 @@ function isRecord7(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 var NO_CHECKPOINT_HASH = sha256(canonicalStringify(null));
+var approvalFaultHooks = null;
 function eventContext(state, at = (/* @__PURE__ */ new Date()).toISOString()) {
   return {
     expectedGeneration: state.generation,
@@ -21792,32 +21793,66 @@ async function claimSessionAuthority(input) {
     return authority.state;
   });
 }
+function approvalIdentityMatches(state, identity2) {
+  if (identity2 === void 0) return state.authority === null;
+  return state.authority?.runtime === identity2.runtime && state.authority.rootSessionId === identity2.sessionId;
+}
+function isSameCompletedApproval(state, checkpointingState, contractHash, identity2) {
+  return (state.status === "active" || state.status === "mutation_pending") && state.contract?.contractHash === contractHash && state.generation > checkpointingState.generation && state.revision === checkpointingState.revision && approvalIdentityMatches(state, identity2);
+}
 async function approvePlan(planText, root, identity2) {
   if (identity2 !== void 0 && (!["claude", "omp", "pi"].includes(identity2.runtime) || !isAuthorityIdentifier(identity2.sessionId))) {
     throw new Error("Trusted approval identity is malformed");
   }
   const contract = compileContract(planText, root);
-  let checkpointingState;
-  checkpointingState = await withProjectLock(contract.root, async () => {
+  const preparation = await withProjectLock(contract.root, async () => {
     const layout = await stateLayout(contract.root);
     const durable = await loadProjectState(layout.canonicalRoot);
-    const initial = durable ?? createProjectState(
-      layout.canonicalRoot,
-      layout.rootHash,
-      (/* @__PURE__ */ new Date()).toISOString()
-    );
-    let staged = transition(initial, {
-      type: "stage",
-      ...eventContext(initial),
-      contract,
-      revision: initial.revision + 1
-    });
-    staged = (await commitStateAndReceiptsUnderLock(
-      layout.canonicalRoot,
-      durable,
-      staged,
-      [lifecycleReceipt(initial, staged, "approve.stage")]
-    )).state;
+    const sameContract = durable?.contract?.contractHash === contract.contractHash;
+    if (durable !== null && (durable.status === "active" || durable.status === "mutation_pending") && sameContract) {
+      if (!approvalIdentityMatches(durable, identity2)) {
+        throw new Error(
+          "Trusted approval identity does not match the active contract"
+        );
+      }
+      return { kind: "active", state: durable };
+    }
+    if (durable !== null && durable.status === "checkpointing" && sameContract) {
+      if (!approvalIdentityMatches(durable, identity2)) {
+        throw new Error(
+          "Trusted approval identity does not match the checkpointing contract"
+        );
+      }
+      return { kind: "checkpointing", state: durable };
+    }
+    let staged;
+    if (durable !== null && durable.status === "staged" && sameContract) {
+      if (durable.authority !== null && !approvalIdentityMatches(durable, identity2)) {
+        throw new Error(
+          "Trusted approval identity does not match the staged contract"
+        );
+      }
+      staged = durable;
+    } else {
+      const initial = durable ?? createProjectState(
+        layout.canonicalRoot,
+        layout.rootHash,
+        (/* @__PURE__ */ new Date()).toISOString()
+      );
+      staged = transition(initial, {
+        type: "stage",
+        ...eventContext(initial),
+        contract,
+        revision: initial.revision + 1
+      });
+      staged = (await commitStateAndReceiptsUnderLock(
+        layout.canonicalRoot,
+        durable,
+        staged,
+        [lifecycleReceipt(initial, staged, "approve.stage")]
+      )).state;
+      await approvalFaultHooks?.afterStage?.();
+    }
     if (identity2 !== void 0) {
       const authority = await preflightAuthorityUnderLock(staged, identity2);
       if (authority.decision !== null) {
@@ -21835,56 +21870,92 @@ async function approvePlan(planText, root, identity2) {
       checkpointing,
       [lifecycleReceipt(staged, checkpointing, "approve.checkpoint.begin")]
     )).state;
-    return checkpointing;
+    await approvalFaultHooks?.afterCheckpointing?.();
+    return { kind: "checkpointing", state: checkpointing };
   });
+  if (preparation.kind === "active") return preparation.state;
+  const checkpointingState = preparation.state;
   let checkpoint;
   try {
     checkpoint = await createCheckpoint(checkpointingState.root);
   } catch (error51) {
     const reason = errorMessage(error51);
+    let completedByPeer = null;
     try {
-      await withProjectLock(checkpointingState.root, async () => {
-        const current = requireLoadedState(
-          await loadProjectState(checkpointingState.root)
-        );
-        const failed = transition(current, {
-          type: "checkpoint_failed",
-          ...eventContext(current),
-          reason
-        });
-        await commitStateAndReceiptsUnderLock(
-          failed.root,
-          current,
-          failed,
-          [
-            lifecycleReceipt(current, failed, "approve.checkpoint.failed"),
-            receiptInput(failed, {
-              event: "checkpoint",
-              runtime: null,
-              sessionId: null,
-              callId: null,
-              toolName: null,
-              inputHash: null,
-              decision: null,
-              lifecycle: { from: current.status, to: failed.status },
-              resultHash: null,
-              metadata: { outcome: "failed", reason }
-            })
-          ]
-        );
-      });
+      completedByPeer = await withProjectLock(
+        checkpointingState.root,
+        async () => {
+          const current = requireLoadedState(
+            await loadProjectState(checkpointingState.root)
+          );
+          if (isSameCompletedApproval(
+            current,
+            checkpointingState,
+            contract.contractHash,
+            identity2
+          )) {
+            return current;
+          }
+          if (current.status !== "checkpointing" || current.contract?.contractHash !== contract.contractHash || !approvalIdentityMatches(current, identity2) || current.generation !== checkpointingState.generation || current.revision !== checkpointingState.revision) {
+            throw new Error(
+              "Checkpoint failure cannot be applied because approval state changed"
+            );
+          }
+          const failed = transition(current, {
+            type: "checkpoint_failed",
+            ...eventContext(current),
+            reason
+          });
+          await commitStateAndReceiptsUnderLock(
+            failed.root,
+            current,
+            failed,
+            [
+              lifecycleReceipt(current, failed, "approve.checkpoint.failed"),
+              receiptInput(failed, {
+                event: "checkpoint",
+                runtime: null,
+                sessionId: null,
+                callId: null,
+                toolName: null,
+                inputHash: null,
+                decision: null,
+                lifecycle: { from: current.status, to: failed.status },
+                resultHash: null,
+                metadata: { outcome: "failed", reason }
+              })
+            ]
+          );
+          return null;
+        }
+      );
     } catch (persistenceError) {
       throw new AggregateError(
         [error51, persistenceError],
         "Checkpoint creation failed and the failure state could not be persisted"
       );
     }
+    if (completedByPeer !== null) return completedByPeer;
     throw error51;
   }
+  await approvalFaultHooks?.afterCheckpointCreated?.(checkpoint);
   return withProjectLock(checkpointingState.root, async () => {
     const current = requireLoadedState(
       await loadProjectState(checkpointingState.root)
     );
+    if (isSameCompletedApproval(
+      current,
+      checkpointingState,
+      contract.contractHash,
+      identity2
+    )) {
+      return current;
+    }
+    if (current.status !== "checkpointing" || current.contract?.contractHash !== contract.contractHash || !approvalIdentityMatches(current, identity2) || current.generation !== checkpointingState.generation || current.revision !== checkpointingState.revision) {
+      throw new Error(
+        "Checkpoint success cannot be applied because approval state changed"
+      );
+    }
     const active = transition(current, {
       type: "checkpoint_succeeded",
       ...eventContext(current),
@@ -22276,6 +22347,7 @@ var MAX_PATH_LENGTH = 65536;
 var MAX_SHORT_FIELD_LENGTH = 1024;
 var CLAUDE_APPROVAL_FILE_MODE = 384;
 var MAX_CLAUDE_APPROVAL_BYTES = 16 * 1024;
+var CLAUDE_PLAN_BINDING_CALL_ID = "plan-binding-v1";
 var CLAUDE_APPROVAL_KEYS = [
   "callId",
   "planHash",
@@ -22493,7 +22565,7 @@ function claudePlanPath(value) {
   }
   return resolved;
 }
-async function claudePlanWritePath(payload, requireFresh) {
+async function claudePlanWritePath(payload) {
   if (payload.agentId !== void 0 || payload.permissionMode !== "plan" || payload.toolName !== "Write") {
     return void 0;
   }
@@ -22512,14 +22584,6 @@ async function claudePlanWritePath(payload, requireFresh) {
     return void 0;
   }
   if (isContainedPath(canonicalRoot, canonicalPlansDirectory)) return void 0;
-  if (requireFresh) {
-    try {
-      await lstat(planPath);
-      return void 0;
-    } catch (error51) {
-      if (!isNodeError3(error51, "ENOENT")) return void 0;
-    }
-  }
   return planPath;
 }
 async function claudeApprovalLocation(payload) {
@@ -22536,6 +22600,15 @@ async function claudePlanWriteLocation(payload, planPath) {
   const key = createHash("sha256").update("plan-write", "utf8").update("\0", "utf8").update(planPath, "utf8").digest("hex");
   return {
     path: join(layout.projectDir, `.claude-plan-write-${key}.json`),
+    projectDirectory: layout.projectDir,
+    root: layout.canonicalRoot
+  };
+}
+async function claudePlanBindingLocation(payload) {
+  const layout = await stateLayout(payload.cwd);
+  const key = createHash("sha256").update("plan-binding", "utf8").update("\0", "utf8").update(payload.sessionId, "utf8").digest("hex");
+  return {
+    path: join(layout.projectDir, `.claude-plan-binding-${key}.json`),
     projectDirectory: layout.projectDir,
     root: layout.canonicalRoot
   };
@@ -22689,6 +22762,134 @@ async function verifyClaudeApproval(location, payload, planHash, mismatchMessage
     throw new ClaudeHookInputError(mismatchMessage);
   }
 }
+function planBindingPayload(payload) {
+  return { ...payload, toolUseId: CLAUDE_PLAN_BINDING_CALL_ID };
+}
+function planPathHash(planPath) {
+  return createHash("sha256").update(planPath, "utf8").digest("hex");
+}
+function validateClaudePlanMetadata(planPath, metadata) {
+  if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size < 0 || metadata.size > MAX_PLAN_BYTES || (metadata.mode & 18) !== 0 || typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
+    throw new ClaudeHookInputError(
+      `Claude's native plan must be a current-user regular file with one link, no group or other write access, and at most ${MAX_PLAN_BYTES} bytes: ${planPath}`
+    );
+  }
+}
+async function validateBoundClaudePlanFile(planPath) {
+  const handle = await open(
+    planPath,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+  );
+  try {
+    validateClaudePlanMetadata(planPath, await handle.stat());
+  } finally {
+    await handle.close();
+  }
+}
+async function syncClaudePlansDirectory(planPath) {
+  const canonicalDirectory = await realpath(dirname(planPath));
+  const handle = await open(
+    canonicalDirectory,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+  );
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isDirectory() || (metadata.mode & 18) !== 0 || typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
+      throw new ClaudeHookInputError(
+        `Claude's plans directory is not safely owned: ${canonicalDirectory}`
+      );
+    }
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+async function verifyClaudePlanBinding(payload, planPath) {
+  const location = await claudePlanBindingLocation(payload);
+  await verifyClaudeApproval(
+    location,
+    planBindingPayload(payload),
+    planPathHash(planPath),
+    "Claude's native plan path is not bound to this root session"
+  );
+  await validateBoundClaudePlanFile(planPath);
+}
+async function reserveClaudePlanPath(payload, planPath) {
+  const location = await claudePlanBindingLocation(payload);
+  try {
+    await lstat(location.path);
+    await verifyClaudePlanBinding(payload, planPath);
+    return;
+  } catch (error51) {
+    if (!isNodeError3(error51, "ENOENT")) throw error51;
+  }
+  try {
+    await lstat(planPath);
+    throw new ClaudeHookInputError(
+      "Claude's native plan path must be a fresh file before it is bound to this session"
+    );
+  } catch (error51) {
+    if (!isNodeError3(error51, "ENOENT")) throw error51;
+  }
+  const requirements = {
+    mode: CLAUDE_APPROVAL_FILE_MODE,
+    maxBytes: MAX_PLAN_BYTES,
+    label: "Claude native plan reservation"
+  };
+  const created = await createSecureFile(
+    planPath,
+    constants.O_WRONLY,
+    requirements
+  );
+  let closed = false;
+  try {
+    await created.handle.sync();
+    await created.handle.close();
+    closed = true;
+    await syncClaudePlansDirectory(planPath);
+    await stageClaudeApproval(
+      location,
+      planBindingPayload(payload),
+      planPathHash(planPath)
+    );
+  } catch (error51) {
+    if (!closed) await created.handle.close().catch(() => void 0);
+    await unlink(planPath).catch(() => void 0);
+    await syncClaudePlansDirectory(planPath).catch(() => void 0);
+    throw error51;
+  }
+}
+async function boundClaudePlanFileIsEmpty(planPath) {
+  const handle = await open(
+    planPath,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+  );
+  try {
+    const metadata = await handle.stat();
+    validateClaudePlanMetadata(planPath, metadata);
+    return metadata.size === 0;
+  } finally {
+    await handle.close();
+  }
+}
+async function stageClaudePlanWrite(location, payload, planPath, planHash) {
+  try {
+    await stageClaudeApproval(location, payload, planHash);
+    return;
+  } catch (error51) {
+    let existing;
+    try {
+      existing = await readClaudeApprovalRecord(location.path);
+    } catch {
+      throw error51;
+    }
+    if (existing.root !== location.root || existing.sessionId !== payload.sessionId || !await boundClaudePlanFileIsEmpty(planPath)) {
+      throw error51;
+    }
+  }
+  await removeClaudeCorrelation(location);
+  await stageClaudeApproval(location, payload, planHash);
+}
 async function removeClaudeCorrelation(location) {
   try {
     await unlink(location.path);
@@ -22703,14 +22904,16 @@ async function claudeApprovalIsAlreadyActive(payload, planHash) {
   return (state.status === "active" || state.status === "mutation_pending") && state.contract?.planHash === planHash && state.authority?.runtime === "claude" && state.authority.rootSessionId === payload.sessionId;
 }
 async function runPreToolUse(payload) {
-  const planWritePath = await claudePlanWritePath(payload, true);
+  const planWritePath = await claudePlanWritePath(payload);
   if (planWritePath !== void 0) {
     try {
       const content = requirePlan(payload.toolInput, "content");
+      await reserveClaudePlanPath(payload, planWritePath);
       const location = await claudePlanWriteLocation(payload, planWritePath);
-      await stageClaudeApproval(
+      await stageClaudePlanWrite(
         location,
         payload,
+        planWritePath,
         createHash("sha256").update(content, "utf8").digest("hex")
       );
     } catch (error51) {
@@ -22724,7 +22927,7 @@ async function runPreToolUse(payload) {
   if (payload.agentId === void 0 && payload.permissionMode === "plan" && payload.toolName === "Write") {
     return structuredDecision(
       "deny",
-      "Claude's native plan must use a fresh file in the default plans directory; custom plansDirectory paths and existing files are unsupported"
+      "Claude's native plan must use a session-bound file in the default plans directory; custom plansDirectory paths are unsupported"
     );
   }
   if (payload.toolName === "ExitPlanMode") {
@@ -22738,7 +22941,25 @@ async function runPreToolUse(payload) {
     let planHash;
     try {
       plan = requirePlan(payload.toolInput, "plan");
-      optionalString(payload.toolInput, "planFilePath", MAX_PATH_LENGTH);
+      const planFilePath = optionalString(
+        payload.toolInput,
+        "planFilePath",
+        MAX_PATH_LENGTH
+      );
+      if (planFilePath !== void 0) {
+        const boundPlanPath = claudePlanPath(planFilePath);
+        if (boundPlanPath === void 0) {
+          throw new ClaudeHookInputError(
+            "ExitPlanMode returned an invalid Claude plan file path"
+          );
+        }
+        await verifyClaudePlanBinding(payload, boundPlanPath);
+        if (await readBoundedPlanFile(boundPlanPath) !== plan) {
+          throw new ClaudeHookInputError(
+            "ExitPlanMode plan does not match its session-bound plan file"
+          );
+        }
+      }
       if (payload.toolInput.allowedPrompts !== void 0 && !Array.isArray(payload.toolInput.allowedPrompts)) {
         throw new ClaudeHookInputError("allowedPrompts must be an array when present");
       }
@@ -22771,9 +22992,10 @@ async function runPostToolUse(payload) {
   if (payload.toolResponse === void 0) {
     throw new ClaudeHookInputError("PostToolUse requires tool_response");
   }
-  const planWritePath = await claudePlanWritePath(payload, false);
+  const planWritePath = await claudePlanWritePath(payload);
   if (planWritePath !== void 0) {
     const expectedPlan = requirePlan(payload.toolInput, "content");
+    await verifyClaudePlanBinding(payload, planWritePath);
     const reservation = await claudePlanWriteLocation(payload, planWritePath);
     await verifyClaudeApproval(
       reservation,
@@ -22830,6 +23052,7 @@ async function runPostToolUse(payload) {
         }
         approvedPlan = inputPlan;
       } else {
+        await verifyClaudePlanBinding(payload, planPath);
         try {
           approvedPlan = await readBoundedPlanFile(planPath);
         } catch (error51) {

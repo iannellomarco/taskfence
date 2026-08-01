@@ -1,6 +1,6 @@
 {
   "name": "taskfence",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Deterministic, hook-enforced task contracts for coding agents",
   "license": "MIT",
   "author": "Marco Iannello",

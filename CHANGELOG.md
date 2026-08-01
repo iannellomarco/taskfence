@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.1.2 - 2026-08-01
+
+### Fixed
+
+- Removed the redundant explicit `hooks/hooks.json` component declaration.
+  Claude Code auto-discovers that standard path; declaring it again caused the
+  installed plugin to report a duplicate-hooks load error.
+- Claude Code can now make repeated native Plan Mode writes to the same
+  session-bound plan path. Pre-existing, cross-session, symlinked, hard-linked,
+  non-regular, wrong-owner, and group- or other-writable destinations remain
+  fail-closed.
+- Approval checkpoint completion is bound to the exact staged revision and
+  generation, so a stale concurrent attempt cannot overwrite a revoked and
+  restarted approval.
+- Claude approval retries now resume an exact durable `staged` or
+  `checkpointing` activation, recognize the matching active contract
+  idempotently, and retain the pre/post approval correlation until activation
+  succeeds.
+
 ## 0.1.1 - 2026-08-01
 
 ### Fixed
