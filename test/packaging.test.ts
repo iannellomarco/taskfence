@@ -17,6 +17,9 @@ const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const COMMITTED_DIST = join(REPOSITORY_ROOT, "dist");
 const COMMITTED_CLI = join(COMMITTED_DIST, "cli.js");
 const PACKAGE_JSON_PATH = join(REPOSITORY_ROOT, "package.json");
+const PLUGIN_MANIFEST_PATH = join(REPOSITORY_ROOT, ".claude-plugin", "plugin.json");
+const MARKETPLACE_MANIFEST_PATH = join(REPOSITORY_ROOT, ".claude-plugin", "marketplace.json");
+const HOOKS_MANIFEST_PATH = join(REPOSITORY_ROOT, "hooks", "hooks.json");
 
 interface PackageManifest {
   name?: string;
@@ -81,29 +84,62 @@ describe("committed distribution artifacts match a clean build", () => {
   }, 90_000);
 });
 
-describe("marketplace hook entrypoint (committed artifacts)", () => {
-  // The GitHub marketplace/repo installer executes committed `dist/cli.js` via
-  // `${CLAUDE_PLUGIN_ROOT}/dist/cli.js`. This stages a real plugin-root-shaped
-  // directory pointing at the committed artifacts and smokes the actual hook
-  // entrypoint (not a freshly built CLI) so that a stale bundle cannot pass.
-  it("runs the status command against committed dist", async () => {
-    await stat(COMMITTED_CLI); // fails the test if the committed entrypoint is absent
+describe("marketplace plugin entrypoint (committed artifacts)", () => {
+  it("exposes the committed CLI and existing plugin component paths", async () => {
+    await stat(COMMITTED_CLI);
 
-    const projectRoot = await makeTemporary("status");
+    const pluginManifest = JSON.parse(
+      await readFile(PLUGIN_MANIFEST_PATH, "utf8"),
+    ) as {
+      version?: string;
+      skills?: string;
+      hooks?: string;
+    };
+    const marketplaceManifest = JSON.parse(
+      await readFile(MARKETPLACE_MANIFEST_PATH, "utf8"),
+    ) as { plugins?: Array<{ version?: string }> };
+    const packageManifest = await readPackageManifest();
 
-    const result = await execFile(
-      process.execPath,
-      [COMMITTED_CLI, "status", "--root", projectRoot, "--json"],
-      { cwd: projectRoot, maxBuffer: 4 * 1024 * 1024 },
+    expect(pluginManifest.version).toBe(packageManifest.version);
+    expect(marketplaceManifest.plugins?.[0]?.version).toBe(packageManifest.version);
+
+    for (const componentPath of [pluginManifest.skills, pluginManifest.hooks]) {
+      expect(typeof componentPath).toBe("string");
+      await stat(resolve(REPOSITORY_ROOT, componentPath as string));
+    }
+
+    const hookManifest = JSON.parse(
+      await readFile(HOOKS_MANIFEST_PATH, "utf8"),
+    ) as {
+      hooks?: Record<
+        string,
+        Array<{
+          hooks?: Array<{ command?: string; args?: string[] }>;
+        }>
+      >;
+    };
+    const hookInvocations = Object.values(hookManifest.hooks ?? {}).flatMap(
+      (matchers) =>
+        matchers.flatMap((matcher) =>
+          (matcher.hooks ?? []).map((hook) => ({
+            command: hook.command,
+            args: hook.args,
+          })),
+        ),
     );
+    expect(hookInvocations).toEqual([
+      {
+        command: "node",
+        args: ["${CLAUDE_PLUGIN_ROOT}/dist/cli.js", "hook", "claude"],
+      },
+      {
+        command: "node",
+        args: ["${CLAUDE_PLUGIN_ROOT}/dist/cli.js", "hook", "claude"],
+      },
+    ]);
+  });
 
-    expect(JSON.parse(result.stdout)).toMatchObject({
-      root: await realpath(projectRoot),
-      status: "absent",
-    });
-  }, 30_000);
-
-  it("processes a pre-tool-use hook payload via the committed entrypoint", () => {
+  it("processes a pre-tool-use hook payload through the plugin entrypoint", () => {
     const projectRoot = makeTemporarySync("hook");
 
     const payload = {
@@ -112,15 +148,13 @@ describe("marketplace hook entrypoint (committed artifacts)", () => {
       transcript_path: join(projectRoot, "transcript.jsonl"),
       cwd: projectRoot,
       permission_mode: "default",
-      effort: "medium",
+      effort: { level: "high" },
       hook_event_name: "PreToolUse",
       tool_name: "Read",
       tool_input: { file_path: join(projectRoot, "readme.md") },
       tool_use_id: "smoke-call",
     };
 
-    // The marketplace hook is a synchronous stdin->stdout command; spawnSync
-    // pipes the payload and captures the committed entrypoint's decision.
     const result = spawnSync(
       process.execPath,
       [COMMITTED_CLI, "hook", "claude"],

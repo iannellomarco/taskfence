@@ -20,7 +20,15 @@ interface ToolCatalog {
 
 const TOOL_CATALOGS: Record<RuntimeName, ToolCatalog> = {
   claude: {
-    read: { Glob: true, Grep: true, Read: true, WebFetch: true, WebSearch: true },
+    read: {
+      EnterPlanMode: true,
+      Glob: true,
+      Grep: true,
+      Read: true,
+      ToolSearch: true,
+      WebFetch: true,
+      WebSearch: true,
+    },
     shell: { Bash: true },
     write: { Write: true },
     create: { Create: true },

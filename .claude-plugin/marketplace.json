@@ -1,14 +1,29 @@
 {
   "name": "taskfence",
+  "description": "TaskFence plugins for deterministic, hook-enforced coding-agent task contracts",
   "owner": {
     "name": "Marco Iannello"
   },
   "plugins": [
     {
       "name": "taskfence",
+      "displayName": "TaskFence",
       "source": "./",
-      "description": "Deterministic application-hook policy enforcement for Claude Code tool calls",
-      "version": "0.1.0"
+      "description": "Deterministic, hook-enforced task contracts for Claude Code coding agents",
+      "version": "0.1.0",
+      "author": {
+        "name": "Marco Iannello"
+      },
+      "homepage": "https://github.com/iannellomarco/taskfence#readme",
+      "repository": "https://github.com/iannellomarco/taskfence",
+      "license": "MIT",
+      "keywords": [
+        "claude-code",
+        "coding-agent",
+        "guardrails",
+        "policy-enforcement",
+        "task-contracts"
+      ]
     }
   ]
 }

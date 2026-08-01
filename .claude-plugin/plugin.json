@@ -1,10 +1,21 @@
 {
   "name": "taskfence",
+  "displayName": "TaskFence",
   "version": "0.1.0",
-  "description": "Deterministic application-hook policy enforcement for Claude Code tool calls",
+  "description": "Deterministic, hook-enforced task contracts for Claude Code coding agents",
   "author": {
     "name": "Marco Iannello"
   },
-  "hooks": "./hooks/hooks.json",
-  "commands": "./commands"
+  "homepage": "https://github.com/iannellomarco/taskfence#readme",
+  "repository": "https://github.com/iannellomarco/taskfence",
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "coding-agent",
+    "guardrails",
+    "policy-enforcement",
+    "task-contracts"
+  ],
+  "skills": "./skills",
+  "hooks": "./hooks/hooks.json"
 }

@@ -97,7 +97,7 @@ flowchart TB
 
 ### Concurrent or changed tool input
 
-- Project state uses an exclusive root-scoped lock, generation/revision compare-and-swap, and stale-lock recovery with inode-identity checks.
+- Project state uses an exclusive root-scoped lock, generation/revision compare-and-swap, and unique quarantine guards for stale-lock recovery. Acquirers scan before and after exclusive creation, and recovery verifies bounded raw payload bytes plus inode identity. When a live or changed candidate must be restored, recovery creates the fixed link before removing its guard; a confirmed dead stale candidate is removed instead.
 - Before allow, the raw host input is hashed and committed as the sole pending command/mutation.
 - Post reconciliation must match runtime, authorized session, call ID, and raw input hash.
 - A mismatch or absent post does not clear the pending record, so subsequent commands/mutations deny.
@@ -192,6 +192,7 @@ TaskFence bounds its own principal data structures but does not promise uninterr
 | Rollback journal entries | 100,000 |
 | Default lock acquisition timeout | 10 seconds |
 | Default stale-lock age | 120 seconds |
+| Concurrent stale-lock quarantine guards | 100 |
 
 A larger tree, unsupported special file, changing worktree, full disk, permission failure, fsync failure, corrupt journal, process crash, or host timeout can prevent activation or require recovery. Approved commands can consume unbounded CPU, memory, disk, network, or wall time outside these TaskFence bookkeeping limits. Denial-of-service by the same user, project content, host, or approved process is not prevented.
 

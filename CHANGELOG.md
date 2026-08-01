@@ -13,7 +13,7 @@ enforcement layer for coding agents.
 ### Added
 
 - **Contract-gated enforcement.** A plan declares exactly one
-  ```` ```taskfence-contract ```` block whose body is a strict JSON object with
+  `taskfence-contract` fenced block whose body is a strict JSON object with
   `version`, `write`, `create`, `delete`, `protected`, `commands`, and
   `packageManager` fields. Unknown or duplicate keys are rejected. `version`
   must be `1`; `packageManager` must be one of `npm`, `pnpm`, `yarn`, `bun`, or
@@ -48,6 +48,9 @@ enforcement layer for coding agents.
   OpenCode, OMP, and Pi. `taskfence install` / `uninstall` (user or project
   scope) and `taskfence doctor` (adapter self-test and host-heartbeat status)
   are provided.
+- **Guided Claude Code setup.** The marketplace plugin includes a `setup` skill
+  that inspects a task in Plan Mode, prepares the least-privileged contract,
+  and hands approval to Claude Code's native `ExitPlanMode` UI.
 - **CLI** (`taskfence` / `tf`) covering `contract validate`, `approve`,
   `amend`, `status`, `complete`, `revoke`, `rollback`, `receipts verify`,
   `receipts list`, `install`, `uninstall`, `doctor`, and the `hook` entrypoint.

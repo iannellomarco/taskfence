@@ -8,64 +8,211 @@
   <a href="package.json"><img src="https://img.shields.io/badge/Node.js-20%2B-339933?logo=nodedotjs&logoColor=white" alt="Node.js 20+"></a>
 </p>
 
-Plans are advisory: an agent can drift from an approved plan and still mutate the repository. **TaskFence turns one exact fenced JSON block in that plan into a frozen, hook-enforced contract.** Known read-only tools remain available, while commands and mutations require an active contract, the bound host-session authority, and an exact policy match.
+## Let Claude Code work inside a fence
 
-TaskFence is application-level mediation for coding-agent tool calls. It checkpoints the project before activation, correlates each permitted mutation with the raw host input and reported outcome after the tool returns, records a tamper-evident receipt chain, and can restore the checkpoint when recovery is required.
+Claude Code already shows you a plan. TaskFence turns that plan into a contract it must follow.
+
+You approve the files Claude may change and the commands it may run for one task. TaskFence saves a restore point before work begins, checks supported write and command tool calls against the approved plan, records what happened, and can put the project back if something goes wrong.
+
+You do not need to write the contract yourself. The included setup skill prepares it from the task you describe.
 
 <p align="center">
   <img src="assets/github-social-preview.svg" alt="TaskFence — deterministic guardrails for coding agents" width="800">
 </p>
 
-## Features
+## Install in Claude Code
 
-- One strict `taskfence-contract` JSON object, hashed together with the exact plan text and canonical project root
-- Separate exact/subtree selectors for writes, creates, deletes, and protected paths
-- Exact command `argv` and working-directory matching with one declared package-manager policy
-- Explicit read-only catalogs; unknown or malformed hooked tools fail closed
-- Pre-tool path/command authorization and post-tool raw-input/outcome correlation
-- One pending mutation at a time, correlated by runtime, session, call ID, and raw-input hash
-- Durable session-authority binding without silently granting unrelated or unverifiable child sessions
-- Tamper-evident JSONL receipts whose hash-chain anchor is committed in durable state
-- Rollback to the pre-approval checkpoint while preserving the project root's `.git` directory
-- Idempotent user/project installers, uninstallers, and runtime diagnostics
+### What you need
 
-## 60-second mental model
+- Claude Code with plugin support
+- Node.js 20 or newer (`node --version` shows your installed version)
+- macOS or Linux
 
-1. Put exactly one `taskfence-contract` fenced block in the plan. Every field is required and unknown fields are rejected.
-2. Validate and approve that exact plan for an existing project root. Approval captures a checkpoint before the contract becomes active.
-3. A supported host binds its stable session to the active contract. Read-only tools can run without a contract; mutations and commands cannot.
-4. Before a mutation, TaskFence authorizes every path or the exact command, then durably records one pending call using the raw host input.
-5. After the tool returns, TaskFence correlates the runtime, session, call ID, raw host input, and reported outcome, then appends a receipt. A failed outcome moves to `recovery_required`, an observed violation moves to `violated`, and mismatched correlation leaves the pending call fail-closed.
+### 1. Add and install the plugin
+
+Run these commands inside Claude Code:
+
+```text
+/plugin marketplace add iannellomarco/taskfence
+/plugin install taskfence@taskfence
+/reload-plugins
+```
+
+When Claude Code asks for an installation scope, choose **Local** for your first try. That enables TaskFence only for you and only in the current project. Choose **User** later if you want it in every project, or **Project** if your team should share the plugin setting.
+
+### 2. Install the lifecycle CLI
+
+The plugin runs its hooks from the bundled artifact. Claude Code's direct `!` shell does not inherit plugin executables on `PATH`, so install the matching CLI once for the user-only status, completion, and rollback commands below:
+
+```text
+!npm install --global github:iannellomarco/taskfence#v0.1.0
+!taskfence status --root .
+```
+
+The status command must print a TaskFence state block. The leading `!` runs these as your direct shell commands rather than as Claude tool calls.
+
+### 3. Give the setup skill a task
+
+```text
+/taskfence:setup Add server-side validation to the signup form and test it
+```
+
+The setup skill will:
+
+1. inspect the project using read-only tools;
+2. enter Plan Mode;
+3. write a normal implementation plan;
+4. add the exact TaskFence contract for that task; and
+5. show Claude Code's normal approval screen.
+
+Review the plan and approve it. TaskFence then creates a checkpoint and activates the contract automatically. There is no second hook installation and no separate `approve` command for the Claude Code flow.
+
+If you run `/taskfence:setup` without a task, it will ask what you want Claude to do.
+
+## What changes after installation
+
+| Claude wants to… | What TaskFence does |
+| --- | --- |
+| Read or search the project | Allows known read-only tools |
+| Edit, create, delete, or rename a file | Checks every affected path against the approved task |
+| Run a shell command | Requires the exact command arguments and working directory from the approved task |
+| Use an unknown or malformed tool call | Denies it instead of guessing |
+| Continue after a failed or mismatched change | Stops later mutations and requires recovery |
+
+TaskFence does not ask Claude to behave better. It places a deterministic check at Claude Code's application-hook boundary.
+
+## A normal protected task
+
+1. **You describe the task.** The setup skill turns it into a plan and a narrow contract.
+2. **You approve the plan.** TaskFence validates the exact plan, saves a checkpoint, and binds it to the current Claude Code session.
+3. **Claude works.** Reads remain available. Writes and commands must match the contract.
+4. **TaskFence records the result.** A successful change gets a receipt linked to the receipts before it.
+5. **You finish or recover.** Complete the task, inspect a rollback, or restore the checkpoint.
 
 ```mermaid
 flowchart LR
-  A[Plan with exact JSON contract] --> B[Validate and approve]
-  B --> C[Checkpoint]
-  C --> D[Active contract and bound host session]
-  D --> E[Pre-tool authorization and correlation]
-  E --> F[Mutation executes]
-  F --> G[Post-tool correlation and receipt]
-  G -->|reported success| D
-  G -->|failure or observed violation| H[Fail-closed recovery state]
-  H --> I[Rollback]
-  I --> J[Checkpoint restored; root .git preserved]
+  A[Your task] --> B[Plan and exact contract]
+  B --> C[Your approval]
+  C --> D[Checkpoint]
+  D --> E[Claude works inside the contract]
+  E --> F[Receipts]
+  E -->|failure or mismatch| G[Fail closed]
+  G --> H[Review or rollback]
 ```
 
-## Installation
+## Check status, finish, or roll back
 
-TaskFence requires Node.js 20 or newer.
+Enter the following commands **yourself inside Claude Code**, including the leading `!`. The `!` prefix is Claude Code's direct shell mode. This distinction matters: TaskFence does not let Claude grant, change, or remove its own authority through a tool call.
 
-### From the npm package
+```text
+# See the current contract state
+!taskfence status --root .
 
-After npm publication, install the package globally:
+# Preview exactly what a rollback would restore
+!taskfence rollback --root . --dry-run
 
-```sh
-npm install --global taskfence
+# Restore the pre-task checkpoint
+!taskfence rollback --root . --yes
+
+# Close a successful task
+!taskfence complete --root . --yes
+
+# Withdraw authority without completing
+!taskfence revoke --root . --reason "scope changed" --yes
 ```
 
-The package exposes both `taskfence` and the shorter `tf` executable.
+Rollback preserves the root `.git` directory, so it restores the worktree without replacing the repository's identity or history.
 
-### From source
+## The contract, in plain English
+
+A contract answers four questions:
+
+- Which existing files may change?
+- Which new files may be created?
+- Which files may be deleted?
+- Which exact commands may run, and from which directory?
+
+The setup skill generates the JSON. You only need to review whether its scope matches the task.
+
+<details>
+<summary>Show an example contract</summary>
+
+```taskfence-contract
+{
+  "version": 1,
+  "write": ["src/signup.ts"],
+  "create": ["test/signup.test.ts"],
+  "delete": [],
+  "protected": [".env"],
+  "commands": [
+    {
+      "argv": ["npm", "test", "--", "test/signup.test.ts"],
+      "cwd": "."
+    }
+  ],
+  "packageManager": "npm"
+}
+```
+
+- A plain path means exactly that path.
+- A path ending in `/**` means that directory and everything below it.
+- Renaming a file requires permission to delete the old path and create the new path.
+- `protected` paths always win over allowed paths.
+- Commands are exact argument lists, not prefixes or wildcards.
+- Every field is required. Unknown fields are rejected.
+
+TaskFence also protects its own control paths and the root `.git` directory without relying on this list.
+
+</details>
+
+See the [Contract Reference](docs/contract-reference.md) for the complete schema and path rules.
+
+## What TaskFence records
+
+Before activation, TaskFence checkpoints the non-`.git` worktree. During the task it permits only one pending mutation at a time and correlates the pre-tool request with the runtime, session, call ID, raw input, and reported post-tool outcome.
+
+Receipts are stored as a SHA-256 chain whose current length and final hash are anchored in durable state. Deleting, reordering, truncating, or editing that ledger is detectable by:
+
+```text
+!taskfence receipts verify --root .
+!taskfence receipts list --root . --limit 50
+```
+
+Receipts are tamper-evident, not immutable. A process already running as your operating-system user can still alter user-owned files.
+
+## Security boundary
+
+> **TaskFence is an application-hook guardrail, not an operating-system sandbox.**
+
+TaskFence mediates supported Claude Code tool calls. It does not contain:
+
+- another terminal or editor;
+- a disabled, modified, or bypassed Claude Code hook;
+- a malicious process already running as your user;
+- native code, daemons, or network services; or
+- side effects inside a command you explicitly approved.
+
+For example, approving `npm test` permits that exact top-level command. TaskFence does not sandbox every script or subprocess that `npm test` launches.
+
+Use containers, virtual machines, least-privilege credentials, and normal code review when you need an operating-system security boundary. Read the [Threat Model](docs/threat-model.md) before using TaskFence for security-sensitive work.
+
+## Other supported coding agents
+
+Claude Code has the simplest flow because normal Plan Mode approval activates the contract.
+
+| Runtime | Status | Activation |
+| --- | --- | --- |
+| Claude Code | Supported | Native Plan Mode approval |
+| OpenCode | Supported with explicit preapproval | Approve the exact plan with the CLI, then submit it through `plan_exit` |
+| OMP | Supported | `/taskfence approve PLAN.md` in the root session |
+| Pi | Supported | `/taskfence approve PLAN.md` in the root session |
+| Codex CLI 0.146.0 | Limited | File mutations are mediated; shell commands are denied because the current hook surface cannot correlate later `write_stdin` calls |
+
+The standalone installer supports `claude`, `codex`, `opencode`, `omp`, and `pi`. See [Runtime Support](docs/runtime-support.md) for exact hook coverage and limitations.
+
+## Install from source
+
+The Claude Code marketplace plugin is the recommended installation. Contributors and users of other runtimes can build the standalone CLI:
 
 ```sh
 git clone https://github.com/iannellomarco/taskfence.git
@@ -75,130 +222,24 @@ npm run build
 node dist/cli.js status --root .
 ```
 
-When running from a checkout, replace `taskfence` in the examples below with `node /absolute/path/to/taskfence/dist/cli.js`. Keep that checkout in place after installation: generated runtime configuration points to its built adapter.
-
-## Quickstart
-
-Install the hook for one runtime. Use `--scope project` to write project-local configuration; the default scope is `user`.
+Install one or more runtime adapters from that checkout:
 
 ```sh
-taskfence install claude --scope project --root .
+node dist/cli.js install claude opencode --scope user --root /path/to/project
+node dist/cli.js install all --scope project --root /path/to/project
 ```
 
-Save this exact example as `PLAN.md` in the project root:
+Keep the checkout in place after installation because generated runtime configuration points to its built adapter.
 
-```taskfence-contract
-{
-  "version": 1,
-  "write": ["src/index.ts"],
-  "create": ["test/index.test.ts"],
-  "delete": [],
-  "protected": ["package-lock.json"],
-  "commands": [
-    {
-      "argv": ["npm", "test", "--", "test/index.test.ts"],
-      "cwd": "."
-    }
-  ],
-  "packageManager": "npm"
-}
-```
+## State location
 
-Validate, approve, and inspect it:
-
-```sh
-taskfence contract validate PLAN.md --root .
-taskfence approve PLAN.md --root .
-taskfence status --root .
-```
-
-`approve` is interactive; add `--yes` only when the surrounding user-controlled workflow already provides the confirmation. Restart or reload the agent runtime after installing its hook or extension.
-
-## Contract rules
-
-### Path selectors
-
-- Selectors are root-relative POSIX paths such as `src/index.ts`.
-- A trailing `/**` is the only subtree form: `src/**` matches `src` and all descendants. Other glob syntax is rejected.
-- `write` applies to an existing target, `create` to an absent target, and `delete` to an existing target. A rename requires the source to match `delete` and the destination to match `create`.
-- `protected` wins over every allow selector. TaskFence always adds `.git/**`, `.taskfence/**`, `.claude/**`, `.codex/**`, `.opencode/**`, `.omp/**`, and `.pi/**`.
-- Existing symlink traversal, physical/logical path disagreement, and multiply linked files are denied rather than guessed through.
-
-### Commands and package managers
-
-A command rule is an exact `argv` array plus an exact existing `cwd` inside the project root. There is no prefix or wildcard matching. Package-manager commands must run at the canonical root.
-
-`packageManager` is one of `npm`, `pnpm`, `yarn`, `bun`, or `none`. If an approved command invokes a package manager, it must be the declared one; conflicting managers, `corepack` indirection, and manager/config overrides are rejected. `none` authorizes no package manager. TaskFence also rejects shell syntax it cannot reduce safely to one deterministic argument vector.
-
-Approving an executable authorizes that exact top-level invocation. It does **not** sandbox or transitively constrain scripts, plugins, subprocesses, or other behavior launched by that command.
-
-See the [Contract Reference](docs/contract-reference.md) for the complete schema and normalization rules.
-
-## Runtime support and activation
-
-| Runtime | Status | Activation UX |
-| --- | --- | --- |
-| Claude Code | Supported | Use normal plan mode. `ExitPlanMode` preflight validates the injected plan and returns `ask`; successful native user approval activates the exact returned plan and binds the root session. Direct CLI approval also works for an externally controlled flow. |
-| OpenCode | Supported with explicit preapproval | Run `taskfence approve PLAN.md --root .`, then submit that exact plan through `plan_exit`. The plugin verifies root and hashes before claiming the host session. |
-| OMP | Supported | In the active root session run `/taskfence approve PLAN.md`. The extension also provides `amend`, `status`, `rollback`, `complete`, and `revoke` subcommands. |
-| Pi | Supported | In the active root session run `/taskfence approve PLAN.md`. The extension exposes the same `/taskfence` lifecycle commands as OMP. |
-| Codex CLI 0.146.0 | Limited | Approve externally with the CLI. The first accepted, correlated file mutation binds the host session. `apply_patch` is mediated; command/shell tools are deliberately denied because later `write_stdin` calls are not visible to the current Codex hook surface. |
-
-Install one or several adapters with runtime names `claude`, `codex`, `opencode`, `omp`, and `pi`:
-
-```sh
-taskfence install claude opencode --scope user --root .
-taskfence install all --scope project --root .
-taskfence uninstall opencode --scope project --root .
-```
-
-`taskfence doctor claude --scope project --root .` inspects the built adapter, installed configuration, and any recent loading heartbeat. Heartbeats are deliberately not bound to a project, process, or session, so `doctor` reports enforcement as unverified and returns nonzero even when its artifact and configuration checks pass. Treat it as diagnostic output, never as proof that hooks are enforcing.
-
-An active contract binds to one runtime's root session. Child-session authority is granted only when that host supplies stable, verifiable ancestry; TaskFence does not claim universal inheritance across every agent or extension mechanism. See [Runtime Support](docs/runtime-support.md) for adapter-specific hook coverage and limitations.
-
-## Operating the contract
-
-```sh
-# Inspect human-readable or machine-readable state
-taskfence status --root .
-taskfence status --root . --json
-
-# Replace the active contract with another exact plan
-taskfence amend PLAN-v2.md --root .
-
-# Inspect rollback before changing the worktree, then restore the checkpoint
-taskfence rollback --root . --dry-run
-taskfence rollback --root .
-
-# Verify and page through the receipt ledger
-taskfence receipts verify --root .
-taskfence receipts list --root . --limit 50
-taskfence receipts list --root . --json
-
-# End normally, or revoke with a durable reason
-taskfence complete --root .
-taskfence revoke --root . --reason "scope changed"
-```
-
-Commands that change lifecycle state prompt on a TTY. Their documented non-interactive form accepts `--yes`. `rollback --dry-run` reports the planned restore without changing the worktree; rollback preserves the root `.git` directory rather than replacing repository identity.
-
-## State and receipts
-
-By default TaskFence stores state outside the protected project root at:
+TaskFence stores state outside the protected project root:
 
 ```text
-${TASKFENCE_STATE_DIR:-${XDG_STATE_HOME:-~/.local/state}/taskfence}/projects/<sha256-of-canonical-root>/
+${TASKFENCE_STATE_DIR:-${XDG_STATE_HOME:-~/.local/state}/taskfence}/projects/<project-hash>/
 ```
 
-`TASKFENCE_STATE_DIR` and `XDG_STATE_HOME`, when set, must be absolute. Directories are current-user-owned mode `0700`; state, lock, checkpoint objects, transaction journals, and receipt files are validated as current-user regular files with mode `0600`. The project directory contains `state.json`, `receipts.jsonl`, checkpoint data, and crash-recovery journals.
-
-Receipts form a SHA-256 chain and the current count, byte length, and last hash are anchored in `state.json`. This makes deletion, truncation, reordering, or modification detectable by `taskfence receipts verify`; it does not make same-user files immutable.
-
-## Security boundary
-
-> **TaskFence is not an OS or kernel sandbox.** It mediates tool calls at supported application hooks. A malicious process running as the same user, a disabled or modified hook/runtime/extension, another terminal or IDE, a daemon, native code, and side effects inside an explicitly approved command are outside its containment boundary. Do not use TaskFence as a substitute for OS isolation, containers, virtual machines, least-privilege credentials, or review of approved scripts.
-
-The state store is hardened against accidental exposure and many path/link attacks, but the same user ultimately owns both runtime configuration and state. Receipt chains are tamper-evident, not tamper-proof. Read the [Threat Model](docs/threat-model.md) before using TaskFence for security-sensitive work and report vulnerabilities through [SECURITY.md](SECURITY.md).
+The store contains the active state, receipts, checkpoint objects, and crash-recovery journals. TaskFence validates owner-only directories and regular files before using them. The implementation relies on POSIX ownership and permission semantics; this release does not claim a Windows enforcement boundary.
 
 ## Development
 
@@ -211,7 +252,7 @@ npm run check:artifact
 npm run build
 ```
 
-CI exercises the declared Node.js 20 floor and Node.js 22 on Linux. The implementation relies on POSIX ownership and permission semantics; this release does not claim a Windows enforcement boundary.
+CI runs on the declared Node.js 20 floor and Node.js 22 on Linux.
 
 ## Documentation
 
@@ -219,10 +260,9 @@ CI exercises the declared Node.js 20 floor and Node.js 22 on Linux. The implemen
 - [Contract Reference](docs/contract-reference.md)
 - [Runtime Support](docs/runtime-support.md)
 - [Threat Model](docs/threat-model.md)
-- [Contributing](CONTRIBUTING.md)
-- [Code of Conduct](CODE_OF_CONDUCT.md)
-- [Changelog](CHANGELOG.md)
 - [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
 
 ## License
 

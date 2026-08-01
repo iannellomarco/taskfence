@@ -16,7 +16,7 @@ TaskFence's standalone CLI declares Node.js 20 or newer. That does not lower hos
 
 ## Installation
 
-The CLI supports the same surface for every adapter:
+Install the pinned CLI with `npm install --global github:iannellomarco/taskfence#v0.1.0`, or build it from the source checkout as described in the [README](../README.md#install-from-source). The CLI supports the same surface for every adapter:
 
 ```sh
 taskfence install claude --scope user

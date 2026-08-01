@@ -169,7 +169,7 @@ describe("receipt confidentiality", () => {
     const rawPrompt = "RAW_PROMPT_SENTINEL: deploy the unreleased plan";
     const rawToolPayload = "RAW_TOOL_PAYLOAD_SENTINEL: overwrite every credential";
     const password = "correct-horse-battery-staple";
-    const apiKey = "sk-0123456789abcdefghijklmnop";
+    const apiKey = "synthetic-api-key-for-redaction";
     const bearer = "opaqueBearerCredential123";
 
     const receipt = await appendReceipt(projectRoot, receiptInput({

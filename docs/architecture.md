@@ -53,7 +53,7 @@ For canonical root hash `H = SHA-256(canonicalRoot)`, project data lives under:
 <state-base>/projects/H/
   state.json
   state.lock
-  state.lock.recover       # present only during stale-lock recovery
+  .stale-lock-<pid|orphan>-<uuid> # transient stale-lock recovery guard; at most 100
   transaction.json         # receipt/state WAL; present only while pending/recovering
   receipts.jsonl
   rollback-journal.json    # present only while rollback is pending/recovering
@@ -63,6 +63,8 @@ For canonical root hash `H = SHA-256(canonicalRoot)`, project data lives under:
 ```
 
 State, lock, WAL, journal, receipt, and temporary files use owner-only modes where created. State replacement is written to a fresh file, `fsync`ed, renamed over `state.json`, and followed by a directory `fsync`.
+
+Stale-lock recovery atomically renames `state.lock` to a unique `.stale-lock-<recoverer-pid>-<uuid>` quarantine file. The quarantine name appears in the same filesystem operation that removes the fixed lock name, so it remains a guard throughout recovery. Acquirers scan for guards both before and after exclusive lock creation; an active recoverer blocks them, while a later process can reconcile a dead recoverer's guard. If cleanup moves a replacement lock that it cannot restore immediately, it atomically hands the guard to a `.stale-lock-orphan-<uuid>` name so reconciliation follows the payload owner's liveness and age rather than the cleanup PID. Restore and cleanup compare bounded raw payload bytes as well as inode identity, and a restore creates the fixed hard link before removing its quarantine name so a crash cannot expose an unguarded gap.
 
 ## Lifecycle
 

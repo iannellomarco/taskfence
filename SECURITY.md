@@ -62,7 +62,7 @@ hook boundary of a supported coding agent. Within that boundary it provides:
 - A **frozen, exact contract** declared before work begins: the approved paths
   an agent may write, create, or delete, the commands it may run, and the paths
   that are explicitly protected. The contract body is strict JSON behind a
-  ```` ```taskfence-contract ```` fence; unknown or duplicate keys are rejected.
+  `taskfence-contract` fence; unknown or duplicate keys are rejected.
 - **Read-only tolerance**: when no contract is active, read-only tool calls are
   allowed and mutations/commands are denied. Mutations and commands require an
   active contract and bound host authority.

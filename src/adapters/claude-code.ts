@@ -86,6 +86,16 @@ function optionalString(
   return requireString(object, field, maximumLength);
 }
 
+function requireEffort(object: JsonRecord): void {
+  if (typeof object.effort === "string") {
+    requireString(object, "effort", MAX_SHORT_FIELD_LENGTH);
+    return;
+  }
+
+  const effort = requireRecord(object.effort, "effort");
+  requireString(effort, "level", MAX_SHORT_FIELD_LENGTH);
+}
+
 function validateBoundedJson(value: unknown): void {
   const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
   const seen = new Set<object>();
@@ -158,7 +168,7 @@ function parsePayload(payload: unknown): ClaudeToolHookPayload {
   requireString(object, "transcript_path", MAX_PATH_LENGTH);
   const cwd = requireString(object, "cwd", MAX_PATH_LENGTH);
   requireString(object, "permission_mode", MAX_SHORT_FIELD_LENGTH);
-  requireString(object, "effort", MAX_SHORT_FIELD_LENGTH);
+  requireEffort(object);
   const agentId = optionalString(object, "agent_id", MAX_IDENTIFIER_LENGTH);
   const agentType = optionalString(object, "agent_type", MAX_SHORT_FIELD_LENGTH);
 
@@ -283,7 +293,7 @@ async function runPreToolUse(
     let plan: string;
     try {
       plan = requirePlan(payload.toolInput, "plan");
-      requireString(payload.toolInput, "planFilePath", MAX_PATH_LENGTH);
+      optionalString(payload.toolInput, "planFilePath", MAX_PATH_LENGTH);
       if (
         payload.toolInput.allowedPrompts !== undefined &&
         !Array.isArray(payload.toolInput.allowedPrompts)

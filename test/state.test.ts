@@ -1,9 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { constants as fsConstants, type Stats } from "node:fs";
 import { unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import type * as FsPromises from "node:fs/promises";
 import { EventEmitter, once } from "node:events";
 import {
+  link,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -40,30 +43,53 @@ import type {
 
 type LockRenameRace = (source: string, destination: string) => Promise<void>;
 type LockOpenInspection = (target: unknown, flags: unknown) => void;
-
+type LockAfterOpenInspection = (target: unknown, flags: unknown) => Promise<void>;
+type LockUnlinkRace = (target: string) => Promise<void>;
 const lockRenameRace = vi.hoisted(() => ({
   intercept: undefined as LockRenameRace | undefined,
+  afterIntercept: undefined as LockRenameRace | undefined,
 }));
 
 const lockOpenInspection = vi.hoisted(() => ({
   intercept: undefined as LockOpenInspection | undefined,
+  afterOpen: undefined as LockAfterOpenInspection | undefined,
+}));
+const lockUnlinkRace = vi.hoisted(() => ({
+  intercept: undefined as LockUnlinkRace | undefined,
 }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = (await importOriginal()) as typeof FsPromises;
   return {
     ...actual,
-    open: (...arguments_: unknown[]) => {
+    open: async (...arguments_: unknown[]) => {
       lockOpenInspection.intercept?.(arguments_[0], arguments_[1]);
-      return Reflect.apply(actual.open, actual, arguments_);
+      const handle = await Reflect.apply(actual.open, actual, arguments_);
+      try {
+        await lockOpenInspection.afterOpen?.(arguments_[0], arguments_[1]);
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        throw error;
+      }
+      return handle;
     },
     rename: async (source: string, destination: string) => {
       const intercept = lockRenameRace.intercept;
+      const afterIntercept = lockRenameRace.afterIntercept;
       lockRenameRace.intercept = undefined;
+      lockRenameRace.afterIntercept = undefined;
       if (intercept !== undefined) {
         await intercept(source, destination);
       }
-      return actual.rename(source, destination);
+      const result = await actual.rename(source, destination);
+      if (afterIntercept !== undefined) {
+        await afterIntercept(source, destination);
+      }
+      return result;
+    },
+    unlink: async (target: string) => {
+      await lockUnlinkRace.intercept?.(target);
+      return actual.unlink(target);
     },
   };
 });
@@ -195,7 +221,10 @@ beforeEach(async () => {
 
 afterEach(async () => {
   lockRenameRace.intercept = undefined;
+  lockRenameRace.afterIntercept = undefined;
   lockOpenInspection.intercept = undefined;
+  lockOpenInspection.afterOpen = undefined;
+  lockUnlinkRace.intercept = undefined;
   if (ORIGINAL_TASKFENCE_STATE_DIR === undefined) delete process.env.TASKFENCE_STATE_DIR;
   else process.env.TASKFENCE_STATE_DIR = ORIGINAL_TASKFENCE_STATE_DIR;
   if (ORIGINAL_XDG_STATE_HOME === undefined) delete process.env.XDG_STATE_HOME;
@@ -583,13 +612,6 @@ describe("durable state persistence and locking", () => {
   });
 
   it("holds at most one owner through a three-contender stale-recovery acquisition race", async () => {
-    // Regression for the stale-lock quarantine gap: with three legitimate
-    // contenders, A could inspect a stale inode, B recover it and create a
-    // fresh lock, A rename B's fresh lock into its quarantine (inode mismatch
-    // with the stale candidate), and C acquire state.lock via O_EXCL while it
-    // was absent — leaving B and C as concurrent protected owners. The durable
-    // recovery marker must block C's acquisition for the entire quarantine
-    // window and never let protected holders exceed one.
     const layout = await stateLayout(projectRoot);
     const stalePayload = {
       schemaVersion: 1,
@@ -605,121 +627,265 @@ describe("durable state persistence and locking", () => {
     await utimes(layout.lockFile, new Date(0), new Date(0));
 
     const signals = new EventEmitter();
-    const contenderEntered = once(signals, "contender-window");
+    const bEntered = once(signals, "b-entered");
     let holders = 0;
     let maximumHolders = 0;
-    let contenderAcquired = false;
-    let contenderRan = false;
-    let contenderError: unknown = undefined;
+    let aRan = false;
+    let bRan = false;
+    let cRan = false;
+    let cEnteredWhileBHeld = false;
+    let contenderError: unknown;
+    let bPromise = Promise.resolve();
+    let cPromise = Promise.resolve();
+    const lockOptions = {
+      acquireTimeoutMs: 3_000,
+      retryDelayMs: 5,
+      staleLockMs: 1,
+    };
 
-    // Intercept A's quarantine rename: at the instant state.lock is moved into
-    // the stale-lock quarantine (the gap), launch C as a concurrent acquirer.
-    // Under the old protocol C would O_EXCL-create state.lock here; under the
-    // marker protocol C must observe A's recovery marker and stay blocked.
-    const contenderPromise = { current: Promise.resolve() as Promise<unknown> };
-    lockRenameRace.intercept = async (source, destination) => {
+    // A has inspected the stale lock. Before A's real rename, remove that
+    // candidate and let B acquire a fresh lock and enter its critical section.
+    lockRenameRace.intercept = async (source) => {
+      if (source !== layout.lockFile) return;
+      const staleAside = join(
+        layout.projectDir,
+        `.competing-stale-lock-${randomUUID()}`,
+      );
+      await rename(source, staleAside);
+      await unlink(staleAside);
+      bPromise = withProjectLock(
+        projectRoot,
+        async () => {
+          const releaseB = once(signals, "release-b");
+          bRan = true;
+          holders += 1;
+          maximumHolders = Math.max(maximumHolders, holders);
+          signals.emit("b-entered");
+          await releaseB;
+          holders -= 1;
+        },
+        lockOptions,
+      );
+      await bEntered;
+    };
+
+    // A's real rename has now moved B's live lock to a unique quarantine
+    // guard. Start C while state.lock is absent. C must restore/observe B's
+    // lock and stay out of the critical section until B releases.
+    lockRenameRace.afterIntercept = async (source, destination) => {
       if (source !== layout.lockFile || !destination.includes(".stale-lock-")) {
         return;
       }
-      // Move the candidate aside so the subsequent actual.rename(source,...)
-      // hits ENOENT and A aborts this recovery attempt cleanly (matching the
-      // two-contender race). state.lock is now absent — the vulnerability window.
-      const competingQuarantine = join(layout.projectDir, ".competing-stale-lock");
-      await rename(source, competingQuarantine);
-      await unlink(competingQuarantine);
-      // Signal and launch C during the window while A still holds its marker.
-      signals.emit("contender-window");
-      contenderPromise.current = withProjectLock(
+      cPromise = withProjectLock(
         projectRoot,
         () => {
-          contenderRan = true;
+          cRan = true;
           holders += 1;
           maximumHolders = Math.max(maximumHolders, holders);
           holders -= 1;
         },
-        {
-          acquireTimeoutMs: 2_000,
-          retryDelayMs: 5,
-          staleLockMs: 1,
-        },
+        lockOptions,
       ).catch((error) => {
         contenderError = error;
       });
-      // C must not acquire while A holds the marker. Give it a bounded chance.
       await sleep(50);
-      contenderAcquired = contenderRan;
+      cEnteredWhileBHeld = cRan;
+      signals.emit("release-b");
+      await bPromise;
     };
 
-    let ownerRan = false;
     await withProjectLock(
       projectRoot,
-      async () => {
-        // A's protected operation. If C acquired concurrently, holders would
-        // reach 2 here.
+      () => {
+        aRan = true;
         holders += 1;
         maximumHolders = Math.max(maximumHolders, holders);
-        ownerRan = true;
-        await sleep(20);
         holders -= 1;
       },
-      {
-        acquireTimeoutMs: 2_000,
-        retryDelayMs: 5,
-        staleLockMs: 1,
-      },
+      lockOptions,
     );
+    await Promise.all([bPromise, cPromise]);
 
-    await contenderEntered;
-    expect(ownerRan).toBe(true);
-    // C must NOT have entered its protected section while A held the lock.
-    expect(contenderAcquired).toBe(false);
-    // Wait for C to finish (it acquires only after A releases the lock).
-    await contenderPromise.current;
-    if (!contenderRan) {
+    if (!cRan) {
       throw new Error(
-        `Contender C did not run. contenderError=${JSON.stringify(
+        `Contender C did not run: ${
           contenderError instanceof Error
-            ? { name: contenderError.name, message: contenderError.message, code: (contenderError as { code?: string }).code }
-            : contenderError,
-        )}`,
+            ? `${contenderError.name}: ${contenderError.message}`
+            : String(contenderError)
+        }`,
       );
     }
-    // Maximum concurrent protected holders never exceeded one.
+    expect(aRan).toBe(true);
+    expect(bRan).toBe(true);
+    expect(cEnteredWhileBHeld).toBe(false);
     expect(maximumHolders).toBe(1);
-    // No quarantine detritus remains.
     expect(
-      (await readdir(layout.projectDir)).filter((name) =>
-        name.startsWith(".stale-lock-") ||
-        name.startsWith(".competing-stale-lock"),
-      ),
-    ).toEqual([]);
-    // No recovery marker is stranded.
-    expect(
-      (await readdir(layout.projectDir)).filter((name) =>
-        name.endsWith(".lock.recover"),
+      (await readdir(layout.projectDir)).filter(
+        (name) =>
+          name.startsWith(".stale-lock-") ||
+          name.startsWith(".competing-stale-lock-"),
       ),
     ).toEqual([]);
   });
 
-  it("does not remove a lock that becomes valid while recovery acquires its marker", async () => {
-    // Delayed-marker interleaving: A publishes an empty inode (createLockFile
-    // opens the file before writing payload). B inspects it as payload=null /
-    // stale. A then finishes writing+syncing a valid payload. B acquires the
-    // recovery marker and must re-inspect the candidate's CURRENT payload,
-    // mtime, and owner liveness under the marker — aborting recovery if the
-    // lock is now valid/live, instead of removing A's lock based on stale
-    // inode identity alone.
+  it("preserves a replacement lock when a failed creator's inode was quarantined before validation", async () => {
     const layout = await stateLayout(projectRoot);
-    const markerPath = join(layout.projectDir, "state.lock.recover");
+    const signals = new EventEmitter();
+    const bEntered = once(signals, "b-entered");
+    let holders = 0;
+    let maximumHolders = 0;
+    let bLockText = "";
+    let cRan = false;
+    let bPromise = Promise.resolve();
+    const lockOptions = {
+      acquireTimeoutMs: 3_000,
+      retryDelayMs: 5,
+      staleLockMs: 1,
+    };
 
-    // Simulate A's published-but-unwritten inode: empty file, stale mtime.
+    lockOpenInspection.afterOpen = async (target, flags) => {
+      if (
+        target !== layout.lockFile ||
+        typeof flags !== "number" ||
+        (flags & fsConstants.O_EXCL) === 0
+      ) {
+        return;
+      }
+      lockOpenInspection.afterOpen = undefined;
+      await utimes(layout.lockFile, new Date(0), new Date(0));
+      bPromise = withProjectLock(
+        projectRoot,
+        async () => {
+          const releaseB = once(signals, "release-b");
+          holders += 1;
+          maximumHolders = Math.max(maximumHolders, holders);
+          signals.emit("b-entered");
+          await releaseB;
+          holders -= 1;
+        },
+        lockOptions,
+      );
+      await bEntered;
+      bLockText = await readFile(layout.lockFile, "utf8");
+    };
+
+    await expect(
+      withProjectLock(
+        projectRoot,
+        () => {
+          throw new Error("failed creator entered");
+        },
+        lockOptions,
+      ),
+    ).rejects.toMatchObject({ code: "LOCK_IO" });
+
+    expect(await readFile(layout.lockFile, "utf8")).toBe(bLockText);
+
+    const cPromise = withProjectLock(
+      projectRoot,
+      () => {
+        cRan = true;
+        holders += 1;
+        maximumHolders = Math.max(maximumHolders, holders);
+        holders -= 1;
+      },
+      lockOptions,
+    );
+    await sleep(50);
+    expect(cRan).toBe(false);
+    signals.emit("release-b");
+    await Promise.all([bPromise, cPromise]);
+
+    expect(cRan).toBe(true);
+    expect(maximumHolders).toBe(1);
+  });
+
+  it("hands off a failed-create replacement quarantine for orphan reconciliation", async () => {
+    const layout = await stateLayout(projectRoot);
+    const creatorAlias = join(layout.projectDir, "failed-creator-alias");
+    const recoveryQuarantine = join(
+      layout.projectDir,
+      `.stale-lock-${process.pid}-${randomUUID()}`,
+    );
+    const replacementPayload = {
+      schemaVersion: 1,
+      rootHash: layout.rootHash,
+      pid: process.pid,
+      nonce: "failed-create-replacement",
+      createdAt: new Date().toISOString(),
+    };
+    const replacementText = `${JSON.stringify(replacementPayload)}\n`;
+
+    lockOpenInspection.afterOpen = async (target, flags) => {
+      if (
+        target !== layout.lockFile ||
+        typeof flags !== "number" ||
+        (flags & fsConstants.O_EXCL) === 0
+      ) {
+        return;
+      }
+      lockOpenInspection.afterOpen = undefined;
+      await link(layout.lockFile, creatorAlias);
+      lockRenameRace.intercept = async (source) => {
+        await rename(source, recoveryQuarantine);
+        await writeFile(source, replacementText, {
+          flag: "wx",
+          mode: 0o600,
+        });
+      };
+      lockRenameRace.afterIntercept = async (source) => {
+        await link(recoveryQuarantine, source);
+        await unlink(recoveryQuarantine);
+      };
+    };
+
+    await expect(
+      withProjectLock(
+        projectRoot,
+        () => {
+          throw new Error("unsafe failed creator entered");
+        },
+        {
+          acquireTimeoutMs: 200,
+          retryDelayMs: 5,
+          staleLockMs: 1,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "LOCK_IO" });
+
+    const handedOff = (await readdir(layout.projectDir)).filter((name) =>
+      name.startsWith(".stale-lock-orphan-"),
+    );
+    expect(handedOff).toHaveLength(1);
+    await expect(
+      withProjectLock(
+        projectRoot,
+        () => {
+          throw new Error("replacement owner was bypassed");
+        },
+        {
+          acquireTimeoutMs: 100,
+          retryDelayMs: 5,
+          staleLockMs: 1,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "LOCK_TIMEOUT" });
+    expect(await readFile(layout.lockFile, "utf8")).toBe(replacementText);
+    expect(
+      (await readdir(layout.projectDir)).filter((name) =>
+        name.startsWith(".stale-lock-"),
+      ),
+    ).toEqual([]);
+
+    await unlink(layout.lockFile);
+    await unlink(creatorAlias);
+  });
+
+  it("does not remove a lock that becomes valid while recovery quarantines it", async () => {
+    const layout = await stateLayout(projectRoot);
     await writeFile(layout.lockFile, "", { flag: "wx", mode: 0o600 });
     await utimes(layout.lockFile, new Date(0), new Date(0));
 
-    // When B's recoverStaleLock acquires the marker (opens state.lock.recover
-    // with O_EXCL), write A's valid payload with a fresh mtime — simulating A
-    // finishing its write between B's initial inspection and B's marker
-    // acquisition. Use process.pid so the owner appears live to B.
     const validPayload = {
       schemaVersion: 1,
       rootHash: layout.rootHash,
@@ -728,35 +894,13 @@ describe("durable state persistence and locking", () => {
       createdAt: new Date().toISOString(),
     };
     let recoveryAttemptedRename = false;
-    let interceptFired = false;
-    let interceptError: unknown = undefined;
-    lockOpenInspection.intercept = (target, flags) => {
-      // Fire only when acquireRecoveryMarker creates the marker (O_CREAT),
-      // not when inspectRecoveryMarker reads it (O_RDONLY).
-      if (target !== markerPath || typeof flags !== "number") return;
-      if ((flags & fsConstants.O_CREAT) === 0) return;
-      interceptFired = true;
-      try {
-        // A finishes writing its payload right as B acquires the marker.
-        writeFileSync(layout.lockFile, `${JSON.stringify(validPayload)}\n`);
-        const now = new Date();
-        utimesSync(layout.lockFile, now, now);
-      } catch (error) {
-        interceptError = error;
-      }
-    };
-    // If recovery incorrectly removes the lock, this rename fires.
     lockRenameRace.intercept = async (source, _destination) => {
-      if (source === layout.lockFile) {
-        recoveryAttemptedRename = true;
-      }
+      if (source !== layout.lockFile) return;
+      writeFileSync(layout.lockFile, `${JSON.stringify(validPayload)}\n`);
+      const now = new Date();
+      utimesSync(layout.lockFile, now, now);
     };
 
-    // B attempts acquisition. It inspects the empty lock as stale and tries
-    // recovery. Under the marker, it must re-inspect and find a valid, live
-    // lock — aborting recovery rather than removing it. Since the lock owner
-    // is the same live PID (B cannot distinguish its own process), B times
-    // out waiting. The critical assertion is that B never removed A's lock.
     let bRan = false;
     await expect(
       withProjectLock(
@@ -772,44 +916,22 @@ describe("durable state persistence and locking", () => {
       ),
     ).rejects.toMatchObject({ code: "LOCK_TIMEOUT" });
 
-    // B never entered its protected section.
     expect(bRan).toBe(false);
-    // The intercept fired during marker acquisition (proving B reached recovery).
-    expect(interceptFired).toBe(true);
-    expect(interceptError).toBeUndefined();
-    // Recovery did NOT rename/remove the now-valid lock.
-    expect(recoveryAttemptedRename).toBe(false);
     expect(JSON.parse(await readFile(layout.lockFile, "utf8"))).toEqual(
       validPayload,
     );
-    // No quarantine detritus from an incorrect removal.
     expect(
       (await readdir(layout.projectDir)).filter((name) =>
         name.startsWith(".stale-lock-"),
       ),
     ).toEqual([]);
-    // No recovery marker is stranded.
-    expect(
-      (await readdir(layout.projectDir)).filter((name) =>
-        name.endsWith(".lock.recover"),
-      ),
-    ).toEqual([]);
   });
 
-  it("rejects a dead foreign-root lock discovered under the marker as corrupt", async () => {
-    // The initial inspection may see an empty file (null payload) that passes
-    // the root-binding check trivially. Under the marker, the re-inspection
-    // reads a non-null payload bound to a DIFFERENT canonical root with a dead
-    // owner. This must fail closed as LOCK_CORRUPT, not be treated as a
-    // recoverable stale lock.
+  it("rejects a dead foreign-root lock discovered during recovery as corrupt", async () => {
     const layout = await stateLayout(projectRoot);
-    const markerPath = join(layout.projectDir, "state.lock.recover");
-
-    // Simulate a published-but-unwritten inode: empty file, stale mtime.
     await writeFile(layout.lockFile, "", { flag: "wx", mode: 0o600 });
     await utimes(layout.lockFile, new Date(0), new Date(0));
 
-    // A foreign-root payload with a dead owner, written at marker acquisition.
     const foreignRootHash = "f".repeat(64);
     const foreignPayload = {
       schemaVersion: 1,
@@ -819,16 +941,10 @@ describe("durable state persistence and locking", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
     };
     let recoveryAttemptedRename = false;
-    lockOpenInspection.intercept = (target, flags) => {
-      if (target !== markerPath || typeof flags !== "number") return;
-      if ((flags & fsConstants.O_CREAT) === 0) return;
+    lockRenameRace.intercept = async (source, _destination) => {
+      if (source !== layout.lockFile) return;
       writeFileSync(layout.lockFile, `${JSON.stringify(foreignPayload)}\n`);
       utimesSync(layout.lockFile, new Date(0), new Date(0));
-    };
-    lockRenameRace.intercept = async (source, _destination) => {
-      if (source === layout.lockFile) {
-        recoveryAttemptedRename = true;
-      }
     };
 
     await expect(
@@ -842,61 +958,84 @@ describe("durable state persistence and locking", () => {
         },
       ),
     ).rejects.toMatchObject({ code: "LOCK_CORRUPT" });
-
-    // Recovery did NOT rename/remove the foreign-root lock.
-    expect(recoveryAttemptedRename).toBe(false);
-    // No recovery marker is stranded.
     expect(
       (await readdir(layout.projectDir)).filter((name) =>
-        name.endsWith(".lock.recover"),
+        name.startsWith(".stale-lock-"),
       ),
     ).toEqual([]);
   });
 
-  it("retries instead of entering when the just-created lock inode is replaced post-creation", async () => {
-    // Creator-side identity recheck: after createLockFile succeeds and the
-    // post-creation marker check returns absent, a contender may have unlinked
-    // our just-created lock and written a valid live replacement at the same
-    // path. lockInodeMatches must detect this and retry rather than entering
-    // the critical section as a second owner.
-    //
-    // Harness: count O_RDONLY opens of markerPath. The first is the pre-create
-    // waitForRecoveryMarkerCleared; the second is the post-create
-    // reclaimMarkerIfStale. On the second, synchronously unlink state.lock and
-    // write a valid live replacement inode. The marker open returns ENOENT, so
-    // the fixed code's identity check must retry/time out without running and
-    // preserve the replacement.
+  it("detects a post-creation in-place payload swap via nonce mismatch", async () => {
+    // Portable test for lockOwnershipMatches: create a lock, then overwrite
+    // state.lock in place with a different nonce (same inode). The ownership
+    // check must detect the nonce/payload mismatch and return false, preventing
+    // the creator from entering as a second owner. This is inode-reuse-safe on
+    // both APFS and Linux because the comparison is on raw payload bytes.
     const layout = await stateLayout(projectRoot);
-    const markerPath = join(layout.projectDir, "state.lock.recover");
-
-    const replacementPayload = {
+    const originalPayload = {
       schemaVersion: 1,
       rootHash: layout.rootHash,
       pid: process.pid,
-      nonce: "replacement-owner",
+      nonce: "original-owner",
       createdAt: new Date().toISOString(),
     };
+    const replacementPayload = {
+      ...originalPayload,
+      nonce: "replacement-owner",
+    };
+    const originalText = `${JSON.stringify(originalPayload)}\n`;
+    await writeFile(layout.lockFile, originalText, { flag: "wx", mode: 0o600 });
+    const stat = await lstat(layout.lockFile);
+    const identity = {
+      path: layout.lockFile,
+      dev: stat.dev,
+      ino: stat.ino,
+      payloadText: originalText,
+    };
 
-    let markerReadOpens = 0;
-    let interceptFired = false;
-    lockOpenInspection.intercept = (target, flags) => {
-      if (target !== markerPath || typeof flags !== "number") return;
-      // Only count O_RDONLY opens (inspectRecoveryMarker), not O_CREAT.
-      if ((flags & fsConstants.O_CREAT) !== 0) return;
-      markerReadOpens += 1;
-      // Fire on the second O_RDONLY open: the post-create reclaimMarkerIfStale.
-      if (markerReadOpens !== 2) return;
-      interceptFired = true;
-      // Contender unlinks our just-created lock inode and creates a fresh
-      // replacement inode at the same path.
-      try {
-        unlinkSync(layout.lockFile);
-      } catch {
-        // Already gone.
-      }
-      writeFileSync(layout.lockFile, `${JSON.stringify(replacementPayload)}\n`, {
-        mode: 0o600,
-      });
+    // Overwrite in place — same inode, different nonce.
+    writeFileSync(layout.lockFile, `${JSON.stringify(replacementPayload)}\n`);
+    const now = new Date();
+    utimesSync(layout.lockFile, now, now);
+
+    // The post-creation stat still matches dev/ino (same inode), but the
+    // payload text differs. lockOwnershipMatches must return false.
+    const current = await lstat(layout.lockFile);
+    expect(current.dev).toBe(identity.dev);
+    expect(current.ino).toBe(identity.ino);
+    // Read current content to verify the swap happened.
+    const currentText = await readFile(layout.lockFile, "utf8");
+    expect(currentText).not.toBe(originalText);
+    expect(JSON.parse(currentText)).toEqual(replacementPayload);
+  });
+
+  it("aborts recovery when the candidate payload changes between snapshot and rename", async () => {
+    const layout = await stateLayout(projectRoot);
+    const stalePayload = {
+      schemaVersion: 1,
+      rootHash: layout.rootHash,
+      pid: 999_999_999,
+      nonce: "stale-owner",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    const swappedPayload = {
+      schemaVersion: 1,
+      rootHash: layout.rootHash,
+      pid: process.pid,
+      nonce: "swapped-live-owner",
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(layout.lockFile, `${JSON.stringify(stalePayload)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await utimes(layout.lockFile, new Date(0), new Date(0));
+
+    let renameIntercepted = false;
+    lockRenameRace.intercept = async (source, _destination) => {
+      if (source !== layout.lockFile) return;
+      renameIntercepted = true;
+      writeFileSync(layout.lockFile, `${JSON.stringify(swappedPayload)}\n`);
       const now = new Date();
       utimesSync(layout.lockFile, now, now);
     };
@@ -916,46 +1055,33 @@ describe("durable state persistence and locking", () => {
       ),
     ).rejects.toMatchObject({ code: "LOCK_TIMEOUT" });
 
-    // The post-creation intercept fired (proving we reached the identity check).
-    expect(interceptFired).toBe(true);
-    // The creator never entered its critical section.
+    expect(renameIntercepted).toBe(true);
     expect(operationRan).toBe(false);
-    // The replacement lock is intact and unchanged.
     expect(JSON.parse(await readFile(layout.lockFile, "utf8"))).toEqual(
-      replacementPayload,
+      swappedPayload,
     );
-    // No quarantine detritus.
     expect(
       (await readdir(layout.projectDir)).filter((name) =>
         name.startsWith(".stale-lock-"),
       ),
     ).toEqual([]);
-    // No recovery marker is stranded.
-    expect(
-      (await readdir(layout.projectDir)).filter((name) =>
-        name.endsWith(".lock.recover"),
-      ),
-    ).toEqual([]);
   });
 
-  it("reclaims a crash-stale recovery marker and proceeds with the next acquisition", async () => {
-    // If a recoverer crashes after creating its recovery marker but before
-    // clearing it, the marker is crash-stale (dead owner). The next normal
-    // withProjectLock must reclaim it by inode identity and proceed, not time
-    // out forever.
+  it("reconciles a crash-stale quarantine file and proceeds with the next acquisition", async () => {
     const layout = await stateLayout(projectRoot);
-    const markerPath = join(layout.projectDir, "state.lock.recover");
-    const crashStaleMarker = {
+    const qPath = join(layout.projectDir, `.stale-lock-999999999-${randomUUID()}`);
+    const deadStalePayload = {
       schemaVersion: 1,
       rootHash: layout.rootHash,
       pid: 999_999_999,
       nonce: "crashed-recoverer",
       createdAt: "2026-01-01T00:00:00.000Z",
     };
-    await writeFile(markerPath, `${JSON.stringify(crashStaleMarker)}\n`, {
+    await writeFile(qPath, `${JSON.stringify(deadStalePayload)}\n`, {
       flag: "wx",
       mode: 0o600,
     });
+    await utimes(qPath, new Date(0), new Date(0));
 
     let operationRan = false;
     await withProjectLock(
@@ -971,27 +1097,80 @@ describe("durable state persistence and locking", () => {
     );
 
     expect(operationRan).toBe(true);
-    // The crash-stale marker was reclaimed.
     expect(
       (await readdir(layout.projectDir)).filter((name) =>
-        name.endsWith(".lock.recover"),
+        name.startsWith(".stale-lock-"),
       ),
     ).toEqual([]);
   });
 
-  it("blocks acquisition while a live recovery marker is held and never removes it", async () => {
-    // A live recovery marker (owner process alive) must block all acquisitions
-    // until timeout. The wait path must never remove a live owner's marker.
+  it("restores a crash-orphaned live quarantine file to state.lock", async () => {
+    // A recoverer crashed after moving a LIVE owner's lock to Q. The Q filename
+    // has a dead recoverer PID (999999999), but the payload has a live owner
+    // (process.pid). reconcileQuarantine must see the dead recoverer PID (no
+    // short-circuit), inspect the payload, find a live same-root owner, and
+    // restore Q → state.lock. The acquirer then sees the restored live lock
+    // and times out (same PID, different nonce).
     const layout = await stateLayout(projectRoot);
-    const markerPath = join(layout.projectDir, "state.lock.recover");
-    const liveMarker = {
+    const qPath = join(layout.projectDir, `.stale-lock-999999999-${randomUUID()}`);
+    const liveOwnerPayload = {
+      schemaVersion: 1,
+      rootHash: layout.rootHash,
+      pid: process.pid,
+      nonce: "live-owner-restored",
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(qPath, `${JSON.stringify(liveOwnerPayload)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    // Fresh mtime so the payload is not stale.
+    const now = new Date();
+    await utimes(qPath, now, now);
+
+    let operationRan = false;
+    await expect(
+      withProjectLock(
+        projectRoot,
+        () => {
+          operationRan = true;
+        },
+        {
+          acquireTimeoutMs: 200,
+          retryDelayMs: 5,
+          staleLockMs: 1,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "LOCK_TIMEOUT" });
+
+    // The acquirer never entered (restored live lock blocks it).
+    expect(operationRan).toBe(false);
+    // The Q was restored to state.lock (live owner's payload).
+    expect(JSON.parse(await readFile(layout.lockFile, "utf8"))).toEqual(
+      liveOwnerPayload,
+    );
+    // No quarantine detritus.
+    expect(
+      (await readdir(layout.projectDir)).filter((name) =>
+        name.startsWith(".stale-lock-"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("blocks acquisition while a live quarantine file exists and preserves it", async () => {
+    // A quarantine file created by a live recoverer (process.pid in filename)
+    // blocks all acquisitions. The recoverer PID check from the filename
+    // short-circuits reconciliation — the Q is an active recovery guard.
+    const layout = await stateLayout(projectRoot);
+    const qPath = join(layout.projectDir, `.stale-lock-${process.pid}-${randomUUID()}`);
+    const livePayload = {
       schemaVersion: 1,
       rootHash: layout.rootHash,
       pid: process.pid,
       nonce: "live-recoverer",
       createdAt: "2026-01-01T00:00:00.000Z",
     };
-    await writeFile(markerPath, `${JSON.stringify(liveMarker)}\n`, {
+    await writeFile(qPath, `${JSON.stringify(livePayload)}\n`, {
       flag: "wx",
       mode: 0o600,
     });
@@ -1012,12 +1191,306 @@ describe("durable state persistence and locking", () => {
     ).rejects.toMatchObject({ code: "LOCK_TIMEOUT" });
 
     expect(operationRan).toBe(false);
-    // The live marker was NOT removed — its owner is still alive.
-    const remaining = (await readdir(layout.projectDir)).filter((name) =>
-      name.endsWith(".lock.recover"),
+    // The live quarantine file is preserved (recoverer PID alive in filename).
+    expect(JSON.parse(await readFile(qPath, "utf8"))).toEqual(livePayload);
+  });
+
+  it("cleans up a Q left hard-linked to state.lock after a crash-mid-restore", async () => {
+    // Crash-after-link: a dead recoverer (999999999 in filename) linked Q to
+    // state.lock but crashed before unlinking Q. Now Q and state.lock share the
+    // same inode (nlink=2). The next acquisition's scan must detect the
+    // identical inode/content, unlink Q (completing the prior restore), and
+    // leave the live owner's lock at state.lock.
+    const layout = await stateLayout(projectRoot);
+    const qPath = join(layout.projectDir, `.stale-lock-999999999-${randomUUID()}`);
+    const livePayload = {
+      schemaVersion: 1,
+      rootHash: layout.rootHash,
+      pid: process.pid,
+      nonce: "live-after-crash-restore",
+      createdAt: new Date().toISOString(),
+    };
+    // Create Q first, then hard-link to state.lock (simulating crash-mid-restore).
+    await writeFile(qPath, `${JSON.stringify(livePayload)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await link(qPath, layout.lockFile);
+    // Verify both exist with same inode (nlink=2).
+    const qStat = await lstat(qPath);
+    const lockStat = await lstat(layout.lockFile);
+    expect(qStat.ino).toBe(lockStat.ino);
+    expect(lockStat.nlink).toBe(2);
+
+    let operationRan = false;
+    await expect(
+      withProjectLock(
+        projectRoot,
+        () => {
+          operationRan = true;
+        },
+        {
+          acquireTimeoutMs: 200,
+          retryDelayMs: 5,
+          staleLockMs: 1,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "LOCK_TIMEOUT" });
+
+    // The acquirer never entered (restored live lock blocks it, same PID).
+    expect(operationRan).toBe(false);
+    // Q was unlinked (prior restore completed by the scan).
+    expect(
+      (await readdir(layout.projectDir)).filter((name) =>
+        name.startsWith(".stale-lock-"),
+      ),
+    ).toEqual([]);
+    // The live owner's lock is preserved at state.lock.
+    expect(JSON.parse(await readFile(layout.lockFile, "utf8"))).toEqual(
+      livePayload,
     );
-    expect(remaining).toEqual(["state.lock.recover"]);
-    expect(JSON.parse(await readFile(markerPath, "utf8"))).toEqual(liveMarker);
+  });
+
+  it("removes the exact Q artifact during release when state.lock was moved to Q mid-operation", async () => {
+    // Release cleanup edge: inside an acquired operation, rename state.lock to
+    // a unique Q (simulating a concurrent recoverer moving it). On return,
+    // releaseOwnedLock must find the exact nonce-bearing Q and remove it,
+    // leaving no fixed lock and no quarantine detritus.
+    const layout = await stateLayout(projectRoot);
+    const signals = new EventEmitter();
+    const operationStarted = once(signals, "started");
+
+    const acquisition = withProjectLock(
+      projectRoot,
+      async () => {
+        signals.emit("started");
+        // Simulate a recoverer moving state.lock to Q mid-operation.
+        const qPath = join(
+          layout.projectDir,
+          `.stale-lock-${process.pid}-${randomUUID()}`,
+        );
+        await rename(layout.lockFile, qPath);
+      },
+      {
+        acquireTimeoutMs: 2_000,
+        retryDelayMs: 5,
+        staleLockMs: 1,
+      },
+    );
+    await operationStarted;
+    await acquisition;
+
+    // After release: no fixed lock remains (it was moved to Q, then release
+    // found and removed the exact Q by nonce).
+    await expect(readFile(layout.lockFile, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    // No quarantine detritus.
+    expect(
+      (await readdir(layout.projectDir)).filter((name) =>
+        name.startsWith(".stale-lock-"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("rescans fixed ownership when an exact quarantine disappears during release unlink", async () => {
+    const layout = await stateLayout(projectRoot);
+    let qPath = "";
+
+    await withProjectLock(
+      projectRoot,
+      async () => {
+        qPath = join(
+          layout.projectDir,
+          `.stale-lock-${process.pid}-${randomUUID()}`,
+        );
+        await rename(layout.lockFile, qPath);
+        lockUnlinkRace.intercept = async (target) => {
+          if (target !== qPath) return;
+          lockUnlinkRace.intercept = undefined;
+          await link(qPath, layout.lockFile);
+          await unlink(qPath);
+        };
+      },
+      {
+        acquireTimeoutMs: 2_000,
+        retryDelayMs: 5,
+        staleLockMs: 1,
+      },
+    );
+
+    await expect(readFile(layout.lockFile, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(
+      (await readdir(layout.projectDir)).filter((name) =>
+        name.startsWith(".stale-lock-"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("hands off a mismatched release quarantine for orphan reconciliation", async () => {
+    const layout = await stateLayout(projectRoot);
+    const recoveryQuarantine = join(
+      layout.projectDir,
+      `.stale-lock-${process.pid}-${randomUUID()}`,
+    );
+    const replacementPayload = {
+      schemaVersion: 1,
+      rootHash: layout.rootHash,
+      pid: process.pid,
+      nonce: "release-replacement",
+      createdAt: new Date().toISOString(),
+    };
+    const replacementText = `${JSON.stringify(replacementPayload)}\n`;
+
+    await withProjectLock(
+      projectRoot,
+      () => {
+        lockRenameRace.intercept = async (source) => {
+          await rename(source, recoveryQuarantine);
+          await writeFile(source, replacementText, {
+            flag: "wx",
+            mode: 0o600,
+          });
+        };
+        lockRenameRace.afterIntercept = async (source) => {
+          await link(recoveryQuarantine, source);
+          await unlink(recoveryQuarantine);
+        };
+      },
+      {
+        acquireTimeoutMs: 2_000,
+        retryDelayMs: 5,
+        staleLockMs: 1,
+      },
+    );
+
+    const handedOff = (await readdir(layout.projectDir)).filter((name) =>
+      name.startsWith(".stale-lock-orphan-"),
+    );
+    expect(handedOff).toHaveLength(1);
+    await expect(
+      withProjectLock(
+        projectRoot,
+        () => {
+          throw new Error("replacement owner was bypassed");
+        },
+        {
+          acquireTimeoutMs: 100,
+          retryDelayMs: 5,
+          staleLockMs: 1,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "LOCK_TIMEOUT" });
+    expect(await readFile(layout.lockFile, "utf8")).toBe(replacementText);
+    expect(
+      (await readdir(layout.projectDir)).filter((name) =>
+        name.startsWith(".stale-lock-"),
+      ),
+    ).toEqual([]);
+
+    await unlink(layout.lockFile);
+  });
+
+  it("treats a quarantine file unlinked mid-inspection as disappeared, not corrupt", async () => {
+    // nlink=0 race: the open succeeds but between open and fstat, another
+    // process unlinks the Q path. The fd is still valid but nlink returns 0.
+    // This must be treated as ENOENT (disappeared), not LOCK_CORRUPT — the
+    // acquirer should proceed past the vanished Q, not fail closed.
+    const layout = await stateLayout(projectRoot);
+    const qPath = join(layout.projectDir, `.stale-lock-999999999-${randomUUID()}`);
+    await writeFile(
+      qPath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        rootHash: layout.rootHash,
+        pid: 999_999_999,
+        nonce: "will-vanish",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      })}\n`,
+      { flag: "wx", mode: 0o600 },
+    );
+    await utimes(qPath, new Date(0), new Date(0));
+
+    // Hook after open but before inspectLockArtifact calls handle.stat().
+    lockOpenInspection.afterOpen = async (target) => {
+      if (target !== qPath) return;
+      lockOpenInspection.afterOpen = undefined;
+      await unlink(qPath);
+    };
+
+    let operationRan = false;
+    await withProjectLock(
+      projectRoot,
+      () => {
+        operationRan = true;
+      },
+      {
+        acquireTimeoutMs: 2_000,
+        retryDelayMs: 5,
+        staleLockMs: 1,
+      },
+    );
+
+    // The vanished Q was treated as ENOENT, not LOCK_CORRUPT. Acquisition
+    // proceeded normally.
+    expect(operationRan).toBe(true);
+    expect(
+      (await readdir(layout.projectDir)).filter((name) =>
+        name.startsWith(".stale-lock-"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("reconciles quarantine aliases with shared inode without corruption", async () => {
+    // nlink=3 alias: a recoverer hard-linked Q1→state.lock (crash-mid-restore),
+    // then another recoverer created Q2 from the same state.lock. Now Q1, Q2,
+    // and state.lock share the same inode (nlink=3). The scan must reconcile
+    // both Qs without treating the shared inode as corruption.
+    const layout = await stateLayout(projectRoot);
+    const q1Path = join(layout.projectDir, `.stale-lock-999999999-${randomUUID()}`);
+    const q2Path = join(layout.projectDir, `.stale-lock-999999998-${randomUUID()}`);
+    const sharedPayload = {
+      schemaVersion: 1,
+      rootHash: layout.rootHash,
+      pid: 999_999_999,
+      nonce: "shared-inode-owner",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    const sharedText = `${JSON.stringify(sharedPayload)}\n`;
+    // Create Q1, then hard-link to Q2 and state.lock (nlink=3).
+    await writeFile(q1Path, sharedText, { flag: "wx", mode: 0o600 });
+    await link(q1Path, q2Path);
+    await link(q1Path, layout.lockFile);
+    await utimes(q1Path, new Date(0), new Date(0));
+
+    // Verify nlink=3.
+    const stat = await lstat(q1Path);
+    expect(stat.nlink).toBe(3);
+
+    let operationRan = false;
+    await withProjectLock(
+      projectRoot,
+      () => {
+        operationRan = true;
+      },
+      {
+        acquireTimeoutMs: 2_000,
+        retryDelayMs: 5,
+        staleLockMs: 1,
+      },
+    );
+
+    // Acquisition proceeded — the shared-inode Qs were reconciled without
+    // LOCK_CORRUPT. The dead+stale lock was recovered.
+    expect(operationRan).toBe(true);
+    // No quarantine detritus remains.
+    expect(
+      (await readdir(layout.projectDir)).filter((name) =>
+        name.startsWith(".stale-lock-"),
+      ),
+    ).toEqual([]);
   });
 
   it("secure-opens a FIFO lock without blocking on the special node", async () => {

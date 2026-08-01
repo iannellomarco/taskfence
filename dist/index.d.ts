@@ -313,6 +313,32 @@ interface ProjectLockOptions {
     retryDelayMs?: number;
     staleRecoveryLimit?: number;
 }
+/**
+ * Quarantine-as-guard lock acquisition.
+ *
+ * Instead of a fixed-path recovery marker (which has no guard for itself),
+ * stale recovery uses an atomic rename of state.lock → a unique quarantine
+ * file (`.stale-lock-<pid|orphan>-<uuid>`). This rename is atomic: state.lock
+ * disappears and the quarantine file appears in the same syscall, so there
+ * is never a state where neither exists.
+ *
+ * Every acquirer scans for quarantine files before O_EXCL creation AND rescans
+ * after creation before entering the critical section. If any quarantine file
+ * exists, the acquirer removes only its own exact nonce-bearing lock artifact
+ * and retries — it never enters while recovery is in progress.
+ *
+ * The recoverer renames the stale lock to quarantine, re-reads the quarantined
+ * file's raw bytes against the under-snapshot, and either deletes it (dead/
+ * stale exact match) or restores it to state.lock (live/mismatched). Unique
+ * quarantine names eliminate ABA/inode-reuse across different recoverers.
+ * Cleanup that races with replacement creation atomically hands an unresolved
+ * guard to an `orphan` name, so later scans use payload liveness and age
+ * instead of mistaking the cleanup process for an active recoverer.
+ *
+ * A crash after rename leaves the quarantine file. A later acquirer either
+ * restores a live owner's lock by linking quarantine→state.lock before
+ * unlinking the guard, or removes a dead stale candidate.
+ */
 declare function withProjectLock<T>(root: string, operation: () => Promise<T> | T, options?: ProjectLockOptions): Promise<T>;
 
 declare function loadProjectState(root: string): Promise<ProjectState | null>;

@@ -94,7 +94,7 @@ function claudePayload(
     transcript_path: join(projectRoot, "claude-transcript.jsonl"),
     cwd: projectRoot,
     permission_mode: "default",
-    effort: "medium",
+    effort: { level: "high" },
     hook_event_name: event,
     tool_name: toolName,
     tool_input: toolInput,

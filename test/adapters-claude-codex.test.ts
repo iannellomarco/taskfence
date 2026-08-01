@@ -47,7 +47,7 @@ function claudePayload(
     transcript_path: join(projectRoot, "claude-transcript.jsonl"),
     cwd: projectRoot,
     permission_mode: "default",
-    effort: "medium",
+    effort: { level: "high" },
     hook_event_name: hookEventName,
     tool_name: toolName,
     tool_input: toolInput,
@@ -122,20 +122,82 @@ afterEach(async () => {
 });
 
 describe("Claude Code adapter", () => {
-  it("accepts the verified Claude 2.1.220 common payload and fails closed when it is malformed", async () => {
-    const valid = await runClaudeHook(
+  it("accepts current and legacy effort payloads and fails closed for malformed effort", async () => {
+    const current = await runClaudeHook(
       claudePayload("PreToolUse", "Read", { file_path: "tracked.txt" }),
     );
-    expect(valid).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+    expect(current).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+
+    const legacyPayload = claudePayload("PreToolUse", "Read", {
+      file_path: "tracked.txt",
+    });
+    legacyPayload.effort = "high";
+    const legacy = await runClaudeHook(legacyPayload);
+    expect(legacy).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+
+    const extendedPayload = claudePayload("PreToolUse", "Read", {
+      file_path: "tracked.txt",
+    });
+    extendedPayload.effort = {
+      level: "future-level",
+      future_option: { enabled: true },
+    };
+    const extended = await runClaudeHook(extendedPayload);
+    expect(extended).toEqual({ exitCode: 0, stdout: "", stderr: "" });
 
     const missingEffort = claudePayload("PreToolUse", "Read", {
       file_path: "tracked.txt",
     });
     delete missingEffort.effort;
-    const malformed = await runClaudeHook(missingEffort);
-    expect(malformed.exitCode).toBe(2);
-    expect(malformed.stdout).toBe("");
-    expect(malformed.stderr).toMatch(/TaskFence Claude hook internal error:.+\n$/u);
+
+    const malformedEfforts: Array<[string, unknown]> = [
+      ["missing", undefined],
+      ["null", null],
+      ["empty legacy string", ""],
+      ["overlong legacy string", "x".repeat(1_025)],
+      ["NUL-containing legacy string", "high\0"],
+      ["array", [{ level: "high" }]],
+      ["unrelated number scalar", 42],
+      ["unrelated boolean scalar", true],
+      ["object missing level", {}],
+      ["object with empty level", { level: "" }],
+      ["object with non-string level", { level: 42 }],
+      ["object with overlong level", { level: "x".repeat(1_025) }],
+      ["object with NUL-containing level", { level: "high\0" }],
+    ];
+
+    for (const [label, effort] of malformedEfforts) {
+      const payload =
+        label === "missing"
+          ? missingEffort
+          : {
+              ...claudePayload("PreToolUse", "Read", {
+                file_path: "tracked.txt",
+              }),
+              effort,
+            };
+      const malformed = await runClaudeHook(payload);
+      expect(malformed.exitCode, label).toBe(2);
+      expect(malformed.stdout, label).toBe("");
+      expect(malformed.stderr, label).toMatch(
+        /TaskFence Claude hook internal error:.+\n$/u,
+      );
+    }
+  });
+
+  it("allows Claude's control tools required to enter plan mode", async () => {
+    const search = await runClaudeHook(
+      claudePayload("PreToolUse", "ToolSearch", {
+        query: "select:EnterPlanMode,ExitPlanMode",
+        max_results: 2,
+      }),
+    );
+    expect(search).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+
+    const enter = await runClaudeHook(
+      claudePayload("PreToolUse", "EnterPlanMode", {}, "claude-enter-plan"),
+    );
+    expect(enter).toEqual({ exitCode: 0, stdout: "", stderr: "" });
   });
 
   it("asks for ExitPlanMode approval and activates only after its successful post hook", async () => {
@@ -143,7 +205,6 @@ describe("Claude Code adapter", () => {
     const pre = await runClaudeHook(
       claudePayload("PreToolUse", "ExitPlanMode", {
         plan,
-        planFilePath: join(projectRoot, "plan.md"),
         allowedPrompts: [],
       }),
     );

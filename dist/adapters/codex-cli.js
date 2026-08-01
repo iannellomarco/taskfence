@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'crypto';
 import { constants, lstatSync, statSync, realpathSync, readdirSync } from 'fs';
 import path, { dirname, resolve, isAbsolute, relative, sep, join, basename } from 'path';
-import { realpath, lstat, open, unlink, rename, utimes, chmod, link, mkdir } from 'fs/promises';
+import { realpath, lstat, open, rename, unlink, utimes, chmod, link, readdir, mkdir } from 'fs/promises';
 import { homedir } from 'os';
 import 'readline/promises';
 import { setTimeout } from 'timers/promises';
@@ -16399,7 +16399,15 @@ function evaluateToolCall(contractOrNull, call) {
 }
 var TOOL_CATALOGS = {
   claude: {
-    read: { Glob: true, Grep: true, Read: true, WebFetch: true, WebSearch: true },
+    read: {
+      EnterPlanMode: true,
+      Glob: true,
+      Grep: true,
+      Read: true,
+      ToolSearch: true,
+      WebFetch: true,
+      WebSearch: true
+    },
     shell: { Bash: true },
     write: { Write: true },
     create: { Create: true },
@@ -16785,11 +16793,14 @@ var DEFAULT_STALE_LOCK_MS = 12e4;
 var DEFAULT_RETRY_DELAY_MS = 25;
 var DEFAULT_STALE_RECOVERY_LIMIT = 3;
 var LOCK_FILE_MODE = 384;
-var RECOVERY_MARKER_MODE = 384;
 var MAX_LOCK_BYTES = 16 * 1024;
-var MAX_MARKER_BYTES = 16 * 1024;
-var RECOVERY_MARKER_POLL_MS = 25;
-var MAX_RECOVERY_MARKER_WAITERS = 1e3;
+var QUARANTINE_PREFIX = ".stale-lock-";
+var QUARANTINE_POLL_MS = 25;
+var MAX_QUARANTINE_WAITERS = 1e3;
+var MAX_QUARANTINE_FILES = 100;
+var MAX_LOCK_ARTIFACT_LINKS = MAX_QUARANTINE_FILES + 1;
+var MAX_OWNED_ARTIFACT_CLEANUP_PASSES = 3;
+var QUARANTINE_NAME_PATTERN = /^\.stale-lock-(?:[1-9]\d*|orphan)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 async function withProjectLock(root, operation, options = {}) {
   const layout = await stateLayout(root);
   const acquireTimeoutMs = positiveInteger(
@@ -16815,26 +16826,25 @@ async function withProjectLock(root, operation, options = {}) {
     nonce: randomUUID(),
     createdAt: (/* @__PURE__ */ new Date()).toISOString()
   };
+  const payloadText = `${JSON.stringify(payload)}
+`;
   const deadline = Date.now() + acquireTimeoutMs;
   let staleRecoveries = 0;
-  const marker = {
-    path: `${layout.projectDir}/state.lock.recover`,
-    projectDir: layout.projectDir
-  };
   while (true) {
-    const blocked = await waitForRecoveryMarkerCleared(
-      marker,
-      deadline,
-      layout.rootHash
+    const cleared = await waitForQuarantineCleared(
+      layout.projectDir,
+      layout.rootHash,
+      staleLockMs,
+      deadline
     );
-    if (blocked.kind === "timeout") {
+    if (cleared.kind === "timeout") {
       throw new ProjectLockError(
         "LOCK_TIMEOUT",
         `Timed out acquiring project lock for ${layout.canonicalRoot}`
       );
     }
-    if (blocked.kind === "error") {
-      throw blocked.error;
+    if (cleared.kind === "error") {
+      throw cleared.error;
     }
     let created;
     try {
@@ -16871,11 +16881,10 @@ async function withProjectLock(root, operation, options = {}) {
       if (ageMs >= staleLockMs && !ownerAlive && staleRecoveries < staleRecoveryLimit) {
         const recovered = await recoverStaleLock(
           layout.lockFile,
-          marker,
-          inspected.metadata,
+          layout.projectDir,
+          inspected,
           layout.rootHash,
-          staleLockMs,
-          deadline
+          staleLockMs
         );
         if (recovered.kind === "recovered") {
           staleRecoveries += 1;
@@ -16888,18 +16897,39 @@ async function withProjectLock(root, operation, options = {}) {
       await setTimeout(Math.min(retryDelayMs, Math.max(1, deadline - Date.now())));
       continue;
     }
-    const postCheck = await reclaimMarkerIfStale(marker, layout.rootHash);
+    const postCheck = await scanQuarantine(
+      layout.projectDir,
+      layout.rootHash,
+      staleLockMs
+    );
     if (postCheck.kind === "error") {
-      await removeOwnedLockInode(layout.lockFile, created);
+      await removeOwnedLockArtifacts(
+        layout.lockFile,
+        layout.projectDir,
+        layout.rootHash,
+        staleLockMs,
+        created.payloadText
+      ).catch(() => void 0);
       throw postCheck.error;
     }
     if (postCheck.kind === "present") {
-      await removeOwnedLockInode(layout.lockFile, created);
-      staleRecoveries += 1;
+      await removeOwnedLockArtifacts(
+        layout.lockFile,
+        layout.projectDir,
+        layout.rootHash,
+        staleLockMs,
+        created.payloadText
+      );
       continue;
     }
-    if (!await lockInodeMatches(layout.lockFile, created)) {
-      staleRecoveries += 1;
+    if (!await lockOwnershipMatches(layout.lockFile, created)) {
+      await removeOwnedLockArtifacts(
+        layout.lockFile,
+        layout.projectDir,
+        layout.rootHash,
+        staleLockMs,
+        created.payloadText
+      );
       continue;
     }
     break;
@@ -16910,15 +16940,23 @@ async function withProjectLock(root, operation, options = {}) {
     return await operation();
   } finally {
     clearInterval(heartbeat);
-    await releaseOwnedLock(layout.lockFile, payload);
+    await removeOwnedLockArtifacts(
+      layout.lockFile,
+      layout.projectDir,
+      layout.rootHash,
+      staleLockMs,
+      payloadText
+    );
   }
 }
 async function createLockFile(path7, payload) {
+  const payloadText = `${JSON.stringify(payload)}
+`;
   let handle;
   try {
     handle = await open(
       path7,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+      constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NONBLOCK | constants.O_NOFOLLOW,
       LOCK_FILE_MODE
     );
     await handle.chmod(LOCK_FILE_MODE);
@@ -16929,40 +16967,185 @@ async function createLockFile(path7, payload) {
         `New lock inode is unsafe: ${path7}`
       );
     }
-    await handle.writeFile(`${JSON.stringify(payload)}
-`, "utf8");
+    await handle.writeFile(payloadText, "utf8");
     await handle.sync();
-    const identity = { path: path7, dev: metadata.dev, ino: metadata.ino };
+    const identity = { path: path7, dev: metadata.dev, ino: metadata.ino, payloadText };
     await handle.close();
     handle = void 0;
     return identity;
   } catch (error51) {
     if (handle !== void 0) {
+      const identity = await inspectCreatedLockHandle(handle).catch(() => void 0);
       await handle.close().catch(() => void 0);
-      await unlink(path7).catch(() => void 0);
+      if (identity !== void 0) {
+        await removeFailedCreateArtifact(path7, payload.rootHash, identity).catch(
+          () => void 0
+        );
+      }
     }
     throw error51;
   }
 }
-async function removeOwnedLockInode(lockFile, identity) {
-  try {
-    const current = await lstat(lockFile);
-    if (current.dev === identity.dev && current.ino === identity.ino) {
-      await unlink(lockFile);
+async function inspectCreatedLockHandle(handle) {
+  const metadata = await handle.stat();
+  if (metadata.nlink === 0 || !metadata.isFile() || metadata.size > MAX_LOCK_BYTES || metadata.nlink > MAX_LOCK_ARTIFACT_LINKS) {
+    return void 0;
+  }
+  const buffer = Buffer.allocUnsafe(MAX_LOCK_BYTES + 1);
+  const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+  if (bytesRead > MAX_LOCK_BYTES) return void 0;
+  return {
+    dev: metadata.dev,
+    ino: metadata.ino,
+    text: buffer.subarray(0, bytesRead).toString("utf8")
+  };
+}
+async function removeFailedCreateArtifact(lockFile, rootHash, identity) {
+  const projectDir = dirname(lockFile);
+  for (let pass = 0; pass < MAX_OWNED_ARTIFACT_CLEANUP_PASSES; pass += 1) {
+    let removed = false;
+    let rescanRequired = false;
+    let fixed;
+    try {
+      fixed = await inspectLockArtifact(lockFile, "Lock artifact");
+    } catch (error51) {
+      if (!isNodeError3(error51, "ENOENT")) throw error51;
     }
-  } catch (error51) {
-    if (!isNodeError3(error51, "ENOENT")) ;
+    if (fixed !== void 0 && lockArtifactIdentityMatches(fixed, identity)) {
+      const quarantinePath = `${projectDir}/${QUARANTINE_PREFIX}${process.pid}-${randomUUID()}`;
+      try {
+        await rename(lockFile, quarantinePath);
+        await fsyncDirectory(projectDir);
+        const moved = await inspectQuarantine(quarantinePath);
+        if (lockArtifactIdentityMatches(moved, identity)) {
+          try {
+            await unlink(quarantinePath);
+            removed = true;
+          } catch (error51) {
+            if (!isNodeError3(error51, "ENOENT")) throw error51;
+            rescanRequired = true;
+          }
+        } else {
+          const restored = await restoreQuarantineToLock(
+            quarantinePath,
+            lockFile,
+            projectDir,
+            rootHash,
+            DEFAULT_STALE_LOCK_MS,
+            moved,
+            false
+          );
+          if (restored.kind === "error") throw restored.error;
+          if (restored.kind === "present") {
+            await handOffQuarantineGuard(quarantinePath, projectDir);
+          }
+          rescanRequired = true;
+        }
+      } catch (error51) {
+        if (!isNodeError3(error51, "ENOENT")) throw error51;
+        rescanRequired = true;
+      }
+    }
+    const quarantineFiles = await listQuarantineFiles(projectDir);
+    for (const name of quarantineFiles) {
+      const path7 = `${projectDir}/${name}`;
+      let exactMatch = false;
+      try {
+        const inspected = await inspectQuarantine(path7);
+        if (!lockArtifactIdentityMatches(inspected, identity)) continue;
+        exactMatch = true;
+        await unlink(path7);
+        removed = true;
+      } catch (error51) {
+        if (!isNodeError3(error51, "ENOENT")) throw error51;
+        if (exactMatch) rescanRequired = true;
+      }
+    }
+    if (removed) await fsyncDirectory(projectDir);
+    if (removed || rescanRequired) continue;
+    return;
   }
 }
-async function lockInodeMatches(lockFile, identity) {
+function lockArtifactIdentityMatches(inspected, identity) {
+  return inspected.metadata.dev === identity.dev && inspected.metadata.ino === identity.ino && inspected.text === identity.text;
+}
+async function handOffQuarantineGuard(quarantinePath, projectDir) {
+  const orphanPath = `${projectDir}/${QUARANTINE_PREFIX}orphan-${randomUUID()}`;
+  await rename(quarantinePath, orphanPath);
+  await fsyncDirectory(projectDir);
+}
+async function removeOwnedLockArtifacts(lockFile, projectDir, rootHash, staleLockMs, payloadText) {
+  for (let pass = 0; pass < MAX_OWNED_ARTIFACT_CLEANUP_PASSES; pass += 1) {
+    let removed = false;
+    let rescanRequired = false;
+    let fixed;
+    try {
+      fixed = await inspectLockArtifact(lockFile, "Lock artifact");
+    } catch (error51) {
+      if (!isNodeError3(error51, "ENOENT")) throw error51;
+    }
+    if (fixed?.text === payloadText) {
+      const quarantinePath = `${projectDir}/${QUARANTINE_PREFIX}${process.pid}-${randomUUID()}`;
+      try {
+        await rename(lockFile, quarantinePath);
+        await fsyncDirectory(projectDir);
+        const moved = await inspectQuarantine(quarantinePath);
+        if (moved.text === payloadText) {
+          await unlink(quarantinePath);
+          await fsyncDirectory(projectDir);
+          removed = true;
+        } else {
+          const restored = await restoreQuarantineToLock(
+            quarantinePath,
+            lockFile,
+            projectDir,
+            rootHash,
+            staleLockMs,
+            moved
+          );
+          if (restored.kind === "error") throw restored.error;
+          if (restored.kind === "present") {
+            await handOffQuarantineGuard(quarantinePath, projectDir);
+          }
+          rescanRequired = true;
+        }
+      } catch (error51) {
+        if (!isNodeError3(error51, "ENOENT")) throw error51;
+        rescanRequired = true;
+      }
+    }
+    const quarantineFiles = await listQuarantineFiles(projectDir);
+    for (const name of quarantineFiles) {
+      const path7 = `${projectDir}/${name}`;
+      let exactMatch = false;
+      try {
+        const inspected = await inspectQuarantine(path7);
+        if (inspected.text !== payloadText) continue;
+        exactMatch = true;
+        await unlink(path7);
+        removed = true;
+      } catch (error51) {
+        if (!isNodeError3(error51, "ENOENT")) throw error51;
+        if (exactMatch) rescanRequired = true;
+      }
+    }
+    if (removed) await fsyncDirectory(projectDir);
+    if (removed || rescanRequired) continue;
+    return;
+  }
+}
+async function lockOwnershipMatches(lockFile, identity) {
   try {
-    const current = await lstat(lockFile);
-    return current.dev === identity.dev && current.ino === identity.ino;
+    const current = await inspectLock(lockFile);
+    return current.metadata.dev === identity.dev && current.metadata.ino === identity.ino && current.text === identity.payloadText;
   } catch {
     return false;
   }
 }
 async function inspectLock(path7) {
+  return inspectLockArtifact(path7, "Lock file");
+}
+async function inspectLockArtifact(path7, label) {
   let handle;
   try {
     handle = await open(
@@ -16970,21 +17153,41 @@ async function inspectLock(path7) {
       constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW
     );
     const metadata = await handle.stat();
-    if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size > MAX_LOCK_BYTES || (metadata.mode & 511) !== LOCK_FILE_MODE || typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
+    if (!metadata.isFile() || metadata.size > MAX_LOCK_BYTES || (metadata.mode & 511) !== LOCK_FILE_MODE || typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
       throw new ProjectLockError(
         "LOCK_CORRUPT",
-        `Lock file permissions, ownership, type, or size are unsafe: ${path7}`
+        `${label} permissions, ownership, type, or size are unsafe: ${path7}`
       );
     }
-    const text = await handle.readFile("utf8");
-    return { payload: parseLockPayload(text), metadata };
-  } catch (error51) {
-    if (isNodeError3(error51, "ENOENT")) {
+    if (metadata.nlink === 0) {
+      const error51 = new Error(`File disappeared (nlink=0): ${path7}`);
+      error51.code = "ENOENT";
       throw error51;
     }
-    throw new ProjectLockError("LOCK_CORRUPT", `Cannot inspect lock file: ${path7}`, {
-      cause: error51
-    });
+    if (metadata.nlink > MAX_LOCK_ARTIFACT_LINKS) {
+      throw new ProjectLockError(
+        "LOCK_CORRUPT",
+        `${label} has an unbounded link count (${metadata.nlink}): ${path7}`
+      );
+    }
+    const buffer = Buffer.allocUnsafe(MAX_LOCK_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > MAX_LOCK_BYTES) {
+      throw new ProjectLockError(
+        "LOCK_CORRUPT",
+        `${label} exceeds the size limit: ${path7}`
+      );
+    }
+    const text = buffer.subarray(0, bytesRead).toString("utf8");
+    return { payload: parseLockPayload(text), text, metadata };
+  } catch (error51) {
+    if (isNodeError3(error51, "ENOENT")) throw error51;
+    if (error51 instanceof ProjectLockError) throw error51;
+    throw new ProjectLockError(
+      "LOCK_CORRUPT",
+      `Cannot inspect ${label.toLowerCase()}: ${path7}`,
+      { cause: error51 }
+    );
   } finally {
     await handle?.close().catch(() => void 0);
   }
@@ -17006,204 +17209,188 @@ function parseLockPayload(text) {
     return null;
   }
 }
-async function recoverStaleLock(lockFile, marker, inspected, rootHash, staleLockMs, deadline) {
-  let markerHandle;
-  let markerCreated = false;
-  let markerIdentity;
+async function recoverStaleLock(lockFile, projectDir, inspected, rootHash, staleLockMs) {
+  const quarantinePath = `${projectDir}/${QUARANTINE_PREFIX}${process.pid}-${randomUUID()}`;
   try {
-    const acquired = await acquireRecoveryMarker(marker, rootHash, deadline);
-    if (acquired.kind === "busy" || acquired.kind === "aborted") {
-      return { kind: "aborted" };
-    }
-    if (acquired.kind === "error") {
-      return { kind: "error", error: acquired.error };
-    }
-    markerHandle = acquired.handle;
-    markerIdentity = acquired.identity;
-    markerCreated = true;
-    let currentInspected;
+    const snapshotText = inspected.text;
+    const snapshotDev = inspected.metadata.dev;
+    const snapshotIno = inspected.metadata.ino;
+    await rename(lockFile, quarantinePath);
+    await fsyncDirectory(projectDir);
+    let quarantined;
     try {
-      currentInspected = await inspectLock(lockFile);
+      quarantined = await inspectQuarantine(quarantinePath);
     } catch (error51) {
       if (isNodeError3(error51, "ENOENT")) return { kind: "aborted" };
       throw error51;
     }
-    if (currentInspected.metadata.dev !== inspected.dev || currentInspected.metadata.ino !== inspected.ino) {
-      return { kind: "aborted" };
+    if (quarantined.metadata.dev !== snapshotDev || quarantined.metadata.ino !== snapshotIno || quarantined.text !== snapshotText) {
+      return abortRecoveryAndRestore(
+        quarantinePath,
+        lockFile,
+        projectDir,
+        rootHash,
+        staleLockMs,
+        quarantined
+      );
     }
-    if (currentInspected.payload !== null && currentInspected.payload.rootHash !== rootHash) {
-      return {
-        kind: "error",
-        error: new ProjectLockError(
-          "LOCK_CORRUPT",
-          "Project lock is bound to a different canonical root hash"
-        )
-      };
+    if (quarantined.payload !== null) {
+      if (quarantined.payload.rootHash !== rootHash) {
+        const restored = await restoreQuarantineToLock(
+          quarantinePath,
+          lockFile,
+          projectDir,
+          rootHash,
+          staleLockMs,
+          quarantined
+        );
+        if (restored.kind === "error") return restored;
+        return {
+          kind: "error",
+          error: new ProjectLockError(
+            "LOCK_CORRUPT",
+            "Project lock is bound to a different canonical root hash"
+          )
+        };
+      }
+      if (isProcessAlive(quarantined.payload.pid)) {
+        return abortRecoveryAndRestore(
+          quarantinePath,
+          lockFile,
+          projectDir,
+          rootHash,
+          staleLockMs,
+          quarantined
+        );
+      }
     }
     const currentAgeMs = Math.max(
       0,
-      Date.now() - currentInspected.metadata.mtimeMs
+      Date.now() - quarantined.metadata.mtimeMs
     );
-    const currentOwnerAlive = currentInspected.payload ? isProcessAlive(currentInspected.payload.pid) : false;
-    if (currentAgeMs < staleLockMs || currentOwnerAlive) {
-      return { kind: "aborted" };
-    }
-    const quarantinePath = `${marker.projectDir}/.stale-lock-${process.pid}-${randomUUID()}`;
-    await rename(lockFile, quarantinePath);
-    const quarantined = await lstat(quarantinePath);
-    if (quarantined.dev !== inspected.dev || quarantined.ino !== inspected.ino) {
-      await restoreQuarantinedLock(quarantinePath, lockFile);
-      return { kind: "aborted" };
+    if (currentAgeMs < staleLockMs) {
+      return abortRecoveryAndRestore(
+        quarantinePath,
+        lockFile,
+        projectDir,
+        rootHash,
+        staleLockMs,
+        quarantined
+      );
     }
     await unlink(quarantinePath);
+    await fsyncDirectory(projectDir);
     return { kind: "recovered" };
   } catch (error51) {
-    if (isNodeError3(error51, "ENOENT")) {
-      return { kind: "aborted" };
-    }
+    if (isNodeError3(error51, "ENOENT")) return { kind: "aborted" };
     return {
       kind: "error",
-      error: new ProjectLockError(
+      error: error51 instanceof ProjectLockError ? error51 : new ProjectLockError(
         "LOCK_IO",
         "Unable to recover stale project lock",
         { cause: error51 }
       )
     };
-  } finally {
-    if (markerCreated) {
-      await releaseRecoveryMarker(marker, markerHandle, markerIdentity);
-    } else if (markerHandle !== void 0) {
-      await markerHandle.close().catch(() => void 0);
-    }
   }
 }
-async function restoreQuarantinedLock(stalePath, lockFile) {
+async function abortRecoveryAndRestore(quarantinePath, lockFile, projectDir, rootHash, staleLockMs, inspected) {
+  const restored = await restoreQuarantineToLock(
+    quarantinePath,
+    lockFile,
+    projectDir,
+    rootHash,
+    staleLockMs,
+    inspected
+  );
+  return restored.kind === "error" ? restored : { kind: "aborted" };
+}
+async function inspectQuarantine(path7) {
+  return inspectLockArtifact(path7, "Quarantine file");
+}
+async function listQuarantineFiles(projectDir) {
+  let entries;
   try {
-    await link(stalePath, lockFile);
+    entries = await readdir(projectDir);
   } catch (error51) {
-    if (isNodeError3(error51, "EEXIST")) {
-      await unlink(stalePath).catch(() => void 0);
-      return;
-    }
-    throw error51;
+    if (isNodeError3(error51, "ENOENT")) return [];
+    throw new ProjectLockError("LOCK_IO", "Cannot scan project directory", {
+      cause: error51
+    });
   }
-  await unlink(stalePath);
+  const quarantineFiles = entries.filter((name) => name.startsWith(QUARANTINE_PREFIX)).sort();
+  const malformed2 = quarantineFiles.find(
+    (name) => !QUARANTINE_NAME_PATTERN.test(name)
+  );
+  if (malformed2 !== void 0) {
+    throw new ProjectLockError(
+      "LOCK_CORRUPT",
+      `Malformed quarantine filename: ${malformed2}`
+    );
+  }
+  if (quarantineFiles.length > MAX_QUARANTINE_FILES) {
+    throw new ProjectLockError(
+      "LOCK_CORRUPT",
+      `Too many quarantine files: ${quarantineFiles.length}`
+    );
+  }
+  return quarantineFiles;
 }
-async function acquireRecoveryMarker(marker, rootHash, deadline) {
-  while (Date.now() < deadline) {
-    let handle;
-    try {
-      handle = await open(
-        marker.path,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NONBLOCK | constants.O_NOFOLLOW,
-        RECOVERY_MARKER_MODE
-      );
-      await handle.chmod(RECOVERY_MARKER_MODE);
-      const metadata = await handle.stat();
-      if (!isSafeRecoveryInode(metadata)) {
-        throw new ProjectLockError(
-          "LOCK_CORRUPT",
-          `New recovery marker inode is unsafe: ${marker.path}`
-        );
-      }
-      const payload = {
-        schemaVersion: 1,
-        rootHash,
-        pid: process.pid,
-        nonce: randomUUID(),
-        createdAt: (/* @__PURE__ */ new Date()).toISOString()
-      };
-      await handle.writeFile(`${JSON.stringify(payload)}
-`, "utf8");
-      await handle.sync();
-      return {
-        kind: "acquired",
-        handle,
-        identity: { dev: metadata.dev, ino: metadata.ino }
-      };
-    } catch (error51) {
-      if (handle !== void 0) {
-        await handle.close().catch(() => void 0);
-        await unlink(marker.path).catch(() => void 0);
-      }
-      if (!isNodeError3(error51, "EEXIST")) {
-        return {
-          kind: "error",
-          error: new ProjectLockError(
-            "LOCK_IO",
-            `Unable to create recovery marker: ${marker.path}`,
-            { cause: error51 }
-          )
-        };
-      }
-    }
-    let inspected;
-    try {
-      inspected = await inspectRecoveryMarker(marker, rootHash);
-    } catch (error51) {
-      if (isNodeError3(error51, "ENOENT")) {
-        continue;
-      }
-      if (error51 instanceof ProjectLockError) {
-        return { kind: "error", error: error51 };
-      }
-      return {
-        kind: "error",
-        error: new ProjectLockError(
-          "LOCK_CORRUPT",
-          `Cannot inspect existing recovery marker: ${marker.path}`,
-          { cause: error51 }
-        )
-      };
-    }
-    if (isProcessAlive(inspected.payload.pid)) {
-      return { kind: "busy" };
-    }
-    if (!await removeMarkerByIdentity(marker, inspected.metadata)) {
-      continue;
-    }
-  }
-  return { kind: "aborted" };
+function extractRecovererPid(quarantinePath) {
+  const basename2 = quarantinePath.split("/").pop();
+  if (basename2 === void 0) return null;
+  const match = basename2.match(/^\.stale-lock-([1-9]\d*)-/);
+  return match ? Number.parseInt(match[1], 10) : null;
 }
-async function releaseRecoveryMarker(marker, handle, identity) {
-  if (handle !== void 0) {
-    await handle.sync().catch(() => void 0);
-    await handle.close().catch(() => void 0);
+async function scanQuarantine(projectDir, rootHash, staleLockMs) {
+  let quarantineFiles;
+  try {
+    quarantineFiles = await listQuarantineFiles(projectDir);
+  } catch (error51) {
+    return {
+      kind: "error",
+      error: error51 instanceof ProjectLockError ? error51 : new ProjectLockError(
+        "LOCK_IO",
+        "Cannot scan project directory",
+        { cause: error51 }
+      )
+    };
   }
-  await fsyncDirectory(marker.projectDir);
-  if (identity === void 0) {
-    return;
+  if (quarantineFiles.length === 0) return { kind: "absent" };
+  for (const name of quarantineFiles) {
+    const path7 = `${projectDir}/${name}`;
+    const reconciled = await reconcileQuarantine(
+      path7,
+      projectDir,
+      rootHash,
+      staleLockMs
+    );
+    if (reconciled.kind === "error") {
+      return { kind: "error", error: reconciled.error };
+    }
+    if (reconciled.kind === "present") {
+      return { kind: "present" };
+    }
   }
   try {
-    const current = await lstat(marker.path);
-    if (current.dev === identity.dev && current.ino === identity.ino) {
-      await unlink(marker.path);
-      await fsyncDirectory(marker.projectDir);
-    }
+    const remaining = await listQuarantineFiles(projectDir);
+    return remaining.length > 0 ? { kind: "present" } : { kind: "absent" };
   } catch (error51) {
-    if (!isNodeError3(error51, "ENOENT")) ;
+    return {
+      kind: "error",
+      error: error51 instanceof ProjectLockError ? error51 : new ProjectLockError(
+        "LOCK_IO",
+        "Cannot re-scan project directory",
+        { cause: error51 }
+      )
+    };
   }
 }
-async function removeMarkerByIdentity(marker, expected) {
-  try {
-    const current = await lstat(marker.path);
-    if (current.dev !== expected.dev || current.ino !== expected.ino) {
-      return false;
-    }
-    await unlink(marker.path);
-    await fsyncDirectory(marker.projectDir);
-    return true;
-  } catch (error51) {
-    if (isNodeError3(error51, "ENOENT")) return true;
-    return false;
-  }
-}
-async function reclaimMarkerIfStale(marker, rootHash) {
+async function reconcileQuarantine(quarantinePath, projectDir, rootHash, staleLockMs) {
   let inspected;
   try {
-    inspected = await inspectRecoveryMarker(marker, rootHash);
+    inspected = await inspectQuarantine(quarantinePath);
   } catch (error51) {
-    if (isNodeError3(error51, "ENOENT")) return { kind: "absent" };
+    if (isNodeError3(error51, "ENOENT")) return { kind: "cleared" };
     if (error51 instanceof ProjectLockError) {
       return { kind: "error", error: error51 };
     }
@@ -17211,112 +17398,237 @@ async function reclaimMarkerIfStale(marker, rootHash) {
       kind: "error",
       error: new ProjectLockError(
         "LOCK_CORRUPT",
-        `Cannot inspect recovery marker: ${marker.path}`,
+        `Cannot inspect quarantine file: ${quarantinePath}`,
         { cause: error51 }
       )
     };
   }
-  if (isProcessAlive(inspected.payload.pid)) {
+  const recovererPid = extractRecovererPid(quarantinePath);
+  if (recovererPid !== null && isProcessAlive(recovererPid)) {
     return { kind: "present" };
   }
-  const removed = await removeMarkerByIdentity(marker, inspected.metadata);
-  return removed ? { kind: "absent" } : { kind: "present" };
+  const ageMs = Math.max(0, Date.now() - inspected.metadata.mtimeMs);
+  const lockFile = `${projectDir}/state.lock`;
+  if (inspected.payload !== null) {
+    if (inspected.payload.rootHash !== rootHash) {
+      return {
+        kind: "error",
+        error: new ProjectLockError(
+          "LOCK_CORRUPT",
+          "Quarantine file is bound to a different canonical root hash"
+        )
+      };
+    }
+    if (isProcessAlive(inspected.payload.pid)) {
+      return restoreQuarantineToLock(
+        quarantinePath,
+        lockFile,
+        projectDir,
+        rootHash,
+        staleLockMs,
+        inspected
+      );
+    }
+    if (ageMs < staleLockMs) {
+      return { kind: "present" };
+    }
+    await unlink(quarantinePath);
+    await fsyncDirectory(projectDir);
+    return { kind: "cleared" };
+  }
+  if (ageMs < staleLockMs) {
+    return { kind: "present" };
+  }
+  await unlink(quarantinePath);
+  await fsyncDirectory(projectDir);
+  return { kind: "cleared" };
 }
-async function waitForRecoveryMarkerCleared(marker, deadline, rootHash) {
+async function restoreQuarantineToLock(quarantinePath, lockFile, projectDir, rootHash, staleLockMs, inspected, recoverConflictingLock = true) {
+  let existingLock;
+  try {
+    existingLock = await inspectLockArtifact(lockFile, "Lock artifact");
+  } catch (error51) {
+    if (!isNodeError3(error51, "ENOENT")) {
+      return {
+        kind: "error",
+        error: error51 instanceof ProjectLockError ? error51 : new ProjectLockError(
+          "LOCK_IO",
+          `Cannot inspect project lock while restoring ${quarantinePath}`,
+          { cause: error51 }
+        )
+      };
+    }
+  }
+  if (existingLock !== void 0) {
+    if (existingLock.metadata.dev === inspected.metadata.dev && existingLock.metadata.ino === inspected.metadata.ino && existingLock.text === inspected.text) {
+      try {
+        await unlink(quarantinePath);
+        await fsyncDirectory(projectDir);
+      } catch (error51) {
+        if (!isNodeError3(error51, "ENOENT")) {
+          return {
+            kind: "error",
+            error: new ProjectLockError(
+              "LOCK_IO",
+              `Cannot complete quarantine restoration: ${quarantinePath}`,
+              { cause: error51 }
+            )
+          };
+        }
+      }
+      return { kind: "cleared" };
+    }
+    if (inspected.metadata.nlink > 1) {
+      return { kind: "present" };
+    }
+    if (!recoverConflictingLock || existingLock.metadata.nlink > 1) {
+      return { kind: "present" };
+    }
+    if (existingLock.payload !== null && existingLock.payload.rootHash !== rootHash) {
+      return {
+        kind: "error",
+        error: new ProjectLockError(
+          "LOCK_CORRUPT",
+          "Conflicting project lock is bound to a different canonical root hash"
+        )
+      };
+    }
+    const ageMs = Math.max(0, Date.now() - existingLock.metadata.mtimeMs);
+    if (existingLock.payload !== null && isProcessAlive(existingLock.payload.pid) || ageMs < staleLockMs) {
+      return { kind: "present" };
+    }
+    const cleared = await clearConflictingStaleLock(
+      lockFile,
+      projectDir,
+      rootHash,
+      staleLockMs,
+      existingLock
+    );
+    if (cleared.kind !== "cleared") return cleared;
+  } else if (inspected.metadata.nlink > 1) {
+    return { kind: "present" };
+  }
+  try {
+    await link(quarantinePath, lockFile);
+    await fsyncDirectory(projectDir);
+  } catch (error51) {
+    if (isNodeError3(error51, "EEXIST")) return { kind: "present" };
+    if (isNodeError3(error51, "ENOENT")) return { kind: "cleared" };
+    return {
+      kind: "error",
+      error: new ProjectLockError(
+        "LOCK_IO",
+        `Cannot restore quarantine file: ${quarantinePath}`,
+        { cause: error51 }
+      )
+    };
+  }
+  try {
+    await unlink(quarantinePath);
+    await fsyncDirectory(projectDir);
+  } catch (error51) {
+    if (!isNodeError3(error51, "ENOENT")) {
+      return {
+        kind: "error",
+        error: new ProjectLockError(
+          "LOCK_IO",
+          `Cannot finish restoring quarantine file: ${quarantinePath}`,
+          { cause: error51 }
+        )
+      };
+    }
+  }
+  return { kind: "cleared" };
+}
+async function clearConflictingStaleLock(lockFile, projectDir, rootHash, staleLockMs, inspected) {
+  const quarantinePath = `${projectDir}/${QUARANTINE_PREFIX}${process.pid}-${randomUUID()}`;
+  try {
+    await rename(lockFile, quarantinePath);
+    await fsyncDirectory(projectDir);
+  } catch (error51) {
+    if (isNodeError3(error51, "ENOENT")) return { kind: "cleared" };
+    return {
+      kind: "error",
+      error: new ProjectLockError(
+        "LOCK_IO",
+        "Cannot quarantine a conflicting stale lock",
+        { cause: error51 }
+      )
+    };
+  }
+  let moved;
+  try {
+    moved = await inspectQuarantine(quarantinePath);
+  } catch (error51) {
+    if (isNodeError3(error51, "ENOENT")) return { kind: "cleared" };
+    return {
+      kind: "error",
+      error: error51 instanceof ProjectLockError ? error51 : new ProjectLockError(
+        "LOCK_IO",
+        "Cannot inspect a conflicting stale lock",
+        { cause: error51 }
+      )
+    };
+  }
+  const changed = moved.metadata.dev !== inspected.metadata.dev || moved.metadata.ino !== inspected.metadata.ino || moved.text !== inspected.text;
+  const foreign = moved.payload !== null && moved.payload.rootHash !== rootHash;
+  const ageMs = Math.max(0, Date.now() - moved.metadata.mtimeMs);
+  const active = moved.payload !== null && isProcessAlive(moved.payload.pid) || ageMs < staleLockMs;
+  if (changed || foreign || active) {
+    const restored = await restoreQuarantineToLock(
+      quarantinePath,
+      lockFile,
+      projectDir,
+      rootHash,
+      staleLockMs,
+      moved,
+      false
+    );
+    if (restored.kind === "error") return restored;
+    if (foreign) {
+      return {
+        kind: "error",
+        error: new ProjectLockError(
+          "LOCK_CORRUPT",
+          "Conflicting project lock changed to a foreign canonical root"
+        )
+      };
+    }
+    return { kind: "present" };
+  }
+  try {
+    await unlink(quarantinePath);
+    await fsyncDirectory(projectDir);
+    return { kind: "cleared" };
+  } catch (error51) {
+    if (isNodeError3(error51, "ENOENT")) return { kind: "cleared" };
+    return {
+      kind: "error",
+      error: new ProjectLockError(
+        "LOCK_IO",
+        "Cannot remove a conflicting stale lock",
+        { cause: error51 }
+      )
+    };
+  }
+}
+async function waitForQuarantineCleared(projectDir, rootHash, staleLockMs, deadline) {
   let iterations = 0;
   while (Date.now() < deadline) {
-    if (iterations >= MAX_RECOVERY_MARKER_WAITERS) {
+    if (iterations >= MAX_QUARANTINE_WAITERS) {
       return { kind: "timeout" };
     }
     iterations += 1;
-    const presence = await reclaimMarkerIfStale(marker, rootHash);
+    const presence = await scanQuarantine(projectDir, rootHash, staleLockMs);
     if (presence.kind === "error") {
       return { kind: "error", error: presence.error };
     }
     if (presence.kind === "absent") {
       return { kind: "cleared" };
     }
-    await setTimeout(Math.min(RECOVERY_MARKER_POLL_MS, Math.max(1, deadline - Date.now())));
+    await setTimeout(Math.min(QUARANTINE_POLL_MS, Math.max(1, deadline - Date.now())));
   }
   return { kind: "timeout" };
-}
-async function inspectRecoveryMarker(marker, rootHash) {
-  let handle;
-  try {
-    handle = await open(
-      marker.path,
-      constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW
-    );
-    const metadata = await handle.stat();
-    if (!isSafeRecoveryInode(metadata) || metadata.size > MAX_MARKER_BYTES) {
-      throw new ProjectLockError(
-        "LOCK_CORRUPT",
-        `Recovery marker is unsafe: ${marker.path}`
-      );
-    }
-    const text = await handle.readFile("utf8");
-    const payload = parseRecoveryMarkerPayload(text);
-    if (payload === null) {
-      throw new ProjectLockError(
-        "LOCK_CORRUPT",
-        `Recovery marker payload is invalid: ${marker.path}`
-      );
-    }
-    if (rootHash.length > 0 && payload.rootHash !== rootHash) {
-      throw new ProjectLockError(
-        "LOCK_CORRUPT",
-        "Recovery marker is bound to a different canonical root hash"
-      );
-    }
-    return { payload, metadata };
-  } catch (error51) {
-    if (isNodeError3(error51, "ENOENT")) {
-      throw error51;
-    }
-    if (error51 instanceof ProjectLockError) {
-      throw error51;
-    }
-    throw new ProjectLockError(
-      "LOCK_CORRUPT",
-      `Cannot inspect recovery marker: ${marker.path}`,
-      { cause: error51 }
-    );
-  } finally {
-    await handle?.close().catch(() => void 0);
-  }
-}
-function parseRecoveryMarkerPayload(text) {
-  try {
-    const value = JSON.parse(text);
-    if (!isRecord3(value) || !hasExactKeys(value, [
-      "schemaVersion",
-      "rootHash",
-      "pid",
-      "nonce",
-      "createdAt"
-    ]) || value.schemaVersion !== 1 || typeof value.rootHash !== "string" || !/^[a-f0-9]{64}$/.test(value.rootHash) || !Number.isSafeInteger(value.pid) || value.pid <= 0 || typeof value.nonce !== "string" || value.nonce.length === 0 || typeof value.createdAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.createdAt) || !Number.isFinite(Date.parse(value.createdAt))) {
-      return null;
-    }
-    return value;
-  } catch {
-    return null;
-  }
-}
-function isSafeRecoveryInode(metadata) {
-  return metadata.isFile() && metadata.nlink === 1 && (metadata.mode & 511) === RECOVERY_MARKER_MODE && (typeof process.getuid !== "function" || metadata.uid === process.getuid());
-}
-async function fsyncDirectory(directory) {
-  let handle;
-  try {
-    handle = await open(
-      directory,
-      constants.O_RDONLY | constants.O_NOFOLLOW
-    );
-    await handle.sync();
-  } catch {
-  } finally {
-    await handle?.close().catch(() => void 0);
-  }
 }
 function startHeartbeat(lockFile, payload, staleLockMs) {
   let running = false;
@@ -17336,20 +17648,6 @@ function startHeartbeat(lockFile, payload, staleLockMs) {
   }, Math.max(1e3, Math.floor(staleLockMs / 3)));
   heartbeat.unref();
   return heartbeat;
-}
-async function releaseOwnedLock(lockFile, payload) {
-  try {
-    const inspected = await inspectLock(lockFile);
-    if (inspected.payload?.nonce === payload.nonce) {
-      await unlink(lockFile);
-    }
-  } catch (error51) {
-    if (!isNodeError3(error51, "ENOENT")) {
-      throw new ProjectLockError("LOCK_IO", "Unable to release project lock", {
-        cause: error51
-      });
-    }
-  }
 }
 function isProcessAlive(pid) {
   try {
@@ -17381,6 +17679,16 @@ function hasExactKeys(value, expected) {
 }
 function isRecord3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+async function fsyncDirectory(directory) {
+  let handle;
+  try {
+    handle = await open(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
+    await handle.sync();
+  } catch {
+  } finally {
+    await handle?.close().catch(() => void 0);
+  }
 }
 var STATE_FILE_MODE = 384;
 var MAX_STATE_BYTES = 64 * 1024 * 1024;

@@ -8,11 +8,7 @@
           {
             "type": "command",
             "command": "node",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/dist/cli.js",
-              "hook",
-              "claude"
-            ]
+            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/cli.js", "hook", "claude"]
           }
         ]
       }
@@ -24,11 +20,7 @@
           {
             "type": "command",
             "command": "node",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/dist/cli.js",
-              "hook",
-              "claude"
-            ]
+            "args": ["${CLAUDE_PLUGIN_ROOT}/dist/cli.js", "hook", "claude"]
           }
         ]
       }

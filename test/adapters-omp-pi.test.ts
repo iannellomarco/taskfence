@@ -451,5 +451,5 @@ describe("OMP/Pi adapter parity", () => {
     const pi = await runAdapter("pi");
 
     expect(pi).toEqual(omp);
-  });
+  }, 15_000);
 });

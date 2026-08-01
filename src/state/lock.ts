@@ -4,12 +4,14 @@ import {
   link,
   lstat,
   open,
+  readdir,
   rename,
   unlink,
   utimes,
   type FileHandle,
 } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
+import { dirname } from "node:path";
 import { stateLayout } from "./layout.js";
 import { recoverProjectTransactionUnderLock } from "../receipts/ledger.js";
 import { ProjectLockError } from "./model.js";
@@ -19,11 +21,15 @@ const DEFAULT_STALE_LOCK_MS = 120_000;
 const DEFAULT_RETRY_DELAY_MS = 25;
 const DEFAULT_STALE_RECOVERY_LIMIT = 3;
 const LOCK_FILE_MODE = 0o600;
-const RECOVERY_MARKER_MODE = 0o600;
 const MAX_LOCK_BYTES = 16 * 1024;
-const MAX_MARKER_BYTES = 16 * 1024;
-const RECOVERY_MARKER_POLL_MS = 25;
-const MAX_RECOVERY_MARKER_WAITERS = 1_000;
+const QUARANTINE_PREFIX = ".stale-lock-";
+const QUARANTINE_POLL_MS = 25;
+const MAX_QUARANTINE_WAITERS = 1_000;
+const MAX_QUARANTINE_FILES = 100;
+const MAX_LOCK_ARTIFACT_LINKS = MAX_QUARANTINE_FILES + 1;
+const MAX_OWNED_ARTIFACT_CLEANUP_PASSES = 3;
+const QUARANTINE_NAME_PATTERN =
+  /^\.stale-lock-(?:[1-9]\d*|orphan)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 interface LockPayload {
   schemaVersion: 1;
@@ -33,27 +39,16 @@ interface LockPayload {
   createdAt: string;
 }
 
-interface RecoveryMarkerPayload {
-  schemaVersion: 1;
-  rootHash: string;
-  pid: number;
-  nonce: string;
-  createdAt: string;
-}
-
 interface InspectedLock {
   payload: LockPayload | null;
+  text: string;
   metadata: Stats;
 }
 
-interface InspectedMarker {
-  payload: RecoveryMarkerPayload;
-  metadata: Stats;
-}
-
-interface RecoveryMarkerPath {
-  path: string;
-  projectDir: string;
+interface LockArtifactIdentity {
+  dev: number;
+  ino: number;
+  text: string;
 }
 
 export interface ProjectLockOptions {
@@ -63,7 +58,32 @@ export interface ProjectLockOptions {
   staleRecoveryLimit?: number;
 }
 
-
+/**
+ * Quarantine-as-guard lock acquisition.
+ *
+ * Instead of a fixed-path recovery marker (which has no guard for itself),
+ * stale recovery uses an atomic rename of state.lock → a unique quarantine
+ * file (`.stale-lock-<pid|orphan>-<uuid>`). This rename is atomic: state.lock
+ * disappears and the quarantine file appears in the same syscall, so there
+ * is never a state where neither exists.
+ *
+ * Every acquirer scans for quarantine files before O_EXCL creation AND rescans
+ * after creation before entering the critical section. If any quarantine file
+ * exists, the acquirer removes only its own exact nonce-bearing lock artifact
+ * and retries — it never enters while recovery is in progress.
+ *
+ * The recoverer renames the stale lock to quarantine, re-reads the quarantined
+ * file's raw bytes against the under-snapshot, and either deletes it (dead/
+ * stale exact match) or restores it to state.lock (live/mismatched). Unique
+ * quarantine names eliminate ABA/inode-reuse across different recoverers.
+ * Cleanup that races with replacement creation atomically hands an unresolved
+ * guard to an `orphan` name, so later scans use payload liveness and age
+ * instead of mistaking the cleanup process for an active recoverer.
+ *
+ * A crash after rename leaves the quarantine file. A later acquirer either
+ * restores a live owner's lock by linking quarantine→state.lock before
+ * unlinking the guard, or removes a dead stale candidate.
+ */
 export async function withProjectLock<T>(
   root: string,
   operation: () => Promise<T> | T,
@@ -94,31 +114,32 @@ export async function withProjectLock<T>(
     nonce: randomUUID(),
     createdAt: new Date().toISOString(),
   };
+  const payloadText = `${JSON.stringify(payload)}\n`;
   const deadline = Date.now() + acquireTimeoutMs;
   let staleRecoveries = 0;
 
-  const marker: RecoveryMarkerPath = {
-    path: `${layout.projectDir}/state.lock.recover`,
-    projectDir: layout.projectDir,
-  };
-
   while (true) {
-    const blocked = await waitForRecoveryMarkerCleared(
-      marker,
-      deadline,
+    // Pre-create: wait for any quarantine files to be reconciled. No acquirer
+    // creates a lock while recovery is in progress.
+    const cleared = await waitForQuarantineCleared(
+      layout.projectDir,
       layout.rootHash,
+      staleLockMs,
+      deadline,
     );
-    if (blocked.kind === "timeout") {
+    if (cleared.kind === "timeout") {
       throw new ProjectLockError(
         "LOCK_TIMEOUT",
         `Timed out acquiring project lock for ${layout.canonicalRoot}`,
       );
     }
-    if (blocked.kind === "error") {
-      throw blocked.error;
+    if (cleared.kind === "error") {
+      throw cleared.error;
     }
 
-    let created: { path: string; dev: number; ino: number } | undefined;
+    let created:
+      | { path: string; dev: number; ino: number; payloadText: string }
+      | undefined;
     try {
       created = await createLockFile(layout.lockFile, payload);
     } catch (error) {
@@ -165,11 +186,10 @@ export async function withProjectLock<T>(
       ) {
         const recovered = await recoverStaleLock(
           layout.lockFile,
-          marker,
-          inspected.metadata,
+          layout.projectDir,
+          inspected,
           layout.rootHash,
           staleLockMs,
-          deadline,
         );
         if (recovered.kind === "recovered") {
           staleRecoveries += 1;
@@ -184,28 +204,44 @@ export async function withProjectLock<T>(
       continue;
     }
 
-    // Post-creation checks: a contender may have observed our just-created
-    // inode before its payload was written/synced (empty file → null payload
-    // → treated as stale under a tight staleLockMs). That contender acquires
-    // the recovery marker, removes our inode, creates its own lock, and clears
-    // the marker — all before we reach here. So we must verify BOTH:
-    //   1. No live recovery marker remains (contender still mid-recovery).
-    //   2. state.lock still points at the inode we created. If it was replaced,
-    //      the path now belongs to another owner; remove nothing and retry.
-    const postCheck = await reclaimMarkerIfStale(marker, layout.rootHash);
+    // Post-create rescan: if any quarantine file appeared while we were
+    // creating state.lock, a recovery may be in progress. Remove only our
+    // own exact lock artifact and retry.
+    const postCheck = await scanQuarantine(
+      layout.projectDir,
+      layout.rootHash,
+      staleLockMs,
+    );
     if (postCheck.kind === "error") {
-      await removeOwnedLockInode(layout.lockFile, created);
+      await removeOwnedLockArtifacts(
+        layout.lockFile,
+        layout.projectDir,
+        layout.rootHash,
+        staleLockMs,
+        created.payloadText,
+      ).catch(() => undefined);
       throw postCheck.error;
     }
     if (postCheck.kind === "present") {
-      await removeOwnedLockInode(layout.lockFile, created);
-      staleRecoveries += 1;
+      await removeOwnedLockArtifacts(
+        layout.lockFile,
+        layout.projectDir,
+        layout.rootHash,
+        staleLockMs,
+        created.payloadText,
+      );
       continue;
     }
-    // Marker is absent, but our inode may have been replaced while the marker
-    // was active. Verify ownership before entering the critical section.
-    if (!(await lockInodeMatches(layout.lockFile, created))) {
-      staleRecoveries += 1;
+    // No quarantine files, but our lock may have been replaced (content
+    // overwrite with same inode on Linux). Verify exact payload ownership.
+    if (!(await lockOwnershipMatches(layout.lockFile, created))) {
+      await removeOwnedLockArtifacts(
+        layout.lockFile,
+        layout.projectDir,
+        layout.rootHash,
+        staleLockMs,
+        created.payloadText,
+      );
       continue;
     }
     break;
@@ -217,22 +253,26 @@ export async function withProjectLock<T>(
     return await operation();
   } finally {
     clearInterval(heartbeat);
-    await releaseOwnedLock(layout.lockFile, payload);
+    await removeOwnedLockArtifacts(
+      layout.lockFile,
+      layout.projectDir,
+      layout.rootHash,
+      staleLockMs,
+      payloadText,
+    );
   }
 }
 
-// Creates the lock via O_EXCL and returns the resulting inode identity so the
-// caller can remove exactly that inode (and no other) if a recovery marker
-// appears immediately afterward.
 async function createLockFile(
   path: string,
   payload: LockPayload,
-): Promise<{ path: string; dev: number; ino: number }> {
+): Promise<{ path: string; dev: number; ino: number; payloadText: string }> {
+  const payloadText = `${JSON.stringify(payload)}\n`;
   let handle: FileHandle | undefined;
   try {
     handle = await open(
       path,
-      fsConstants.O_WRONLY |
+      fsConstants.O_RDWR |
         fsConstants.O_CREAT |
         fsConstants.O_EXCL |
         fsConstants.O_NONBLOCK |
@@ -252,86 +292,306 @@ async function createLockFile(
         `New lock inode is unsafe: ${path}`,
       );
     }
-    await handle.writeFile(`${JSON.stringify(payload)}\n`, "utf8");
+    await handle.writeFile(payloadText, "utf8");
     await handle.sync();
-    const identity = { path, dev: metadata.dev, ino: metadata.ino };
+    const identity = { path, dev: metadata.dev, ino: metadata.ino, payloadText };
     await handle.close();
     handle = undefined;
     return identity;
   } catch (error) {
     if (handle !== undefined) {
+      const identity = await inspectCreatedLockHandle(handle).catch(() => undefined);
       await handle.close().catch(() => undefined);
-      await unlink(path).catch(() => undefined);
+      if (identity !== undefined) {
+        await removeFailedCreateArtifact(path, payload.rootHash, identity).catch(
+          () => undefined,
+        );
+      }
     }
     throw error;
   }
 }
 
-// Removes a lock inode only if it still matches the identity we just created.
-// Never unlinks a path that now points at a different inode (e.g. a restored
-// owner's lock or a contender's freshly created lock).
-async function removeOwnedLockInode(
+async function inspectCreatedLockHandle(
+  handle: FileHandle,
+): Promise<LockArtifactIdentity | undefined> {
+  const metadata = await handle.stat();
+  if (
+    metadata.nlink === 0 ||
+    !metadata.isFile() ||
+    metadata.size > MAX_LOCK_BYTES ||
+    metadata.nlink > MAX_LOCK_ARTIFACT_LINKS
+  ) {
+    return undefined;
+  }
+  const buffer = Buffer.allocUnsafe(MAX_LOCK_BYTES + 1);
+  const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+  if (bytesRead > MAX_LOCK_BYTES) return undefined;
+  return {
+    dev: metadata.dev,
+    ino: metadata.ino,
+    text: buffer.subarray(0, bytesRead).toString("utf8"),
+  };
+}
+
+async function removeFailedCreateArtifact(
   lockFile: string,
-  identity: { dev: number; ino: number },
+  rootHash: string,
+  identity: LockArtifactIdentity,
 ): Promise<void> {
-  try {
-    const current = await lstat(lockFile);
-    if (current.dev === identity.dev && current.ino === identity.ino) {
-      await unlink(lockFile);
+  const projectDir = dirname(lockFile);
+  for (
+    let pass = 0;
+    pass < MAX_OWNED_ARTIFACT_CLEANUP_PASSES;
+    pass += 1
+  ) {
+    let removed = false;
+    let rescanRequired = false;
+    let fixed: InspectedLock | undefined;
+    try {
+      fixed = await inspectLockArtifact(lockFile, "Lock artifact");
+    } catch (error) {
+      if (!isNodeError(error, "ENOENT")) throw error;
     }
-  } catch (error) {
-    if (!isNodeError(error, "ENOENT")) {
-      // Best-effort cleanup; the loop retries and O_EXCL prevents double owners.
+
+    if (fixed !== undefined && lockArtifactIdentityMatches(fixed, identity)) {
+      const quarantinePath =
+        `${projectDir}/${QUARANTINE_PREFIX}${process.pid}-${randomUUID()}`;
+      try {
+        await rename(lockFile, quarantinePath);
+        await fsyncDirectory(projectDir);
+        const moved = await inspectQuarantine(quarantinePath);
+        if (lockArtifactIdentityMatches(moved, identity)) {
+          try {
+            await unlink(quarantinePath);
+            removed = true;
+          } catch (error) {
+            if (!isNodeError(error, "ENOENT")) throw error;
+            rescanRequired = true;
+          }
+        } else {
+          const restored = await restoreQuarantineToLock(
+            quarantinePath,
+            lockFile,
+            projectDir,
+            rootHash,
+            DEFAULT_STALE_LOCK_MS,
+            moved,
+            false,
+          );
+          if (restored.kind === "error") throw restored.error;
+          if (restored.kind === "present") {
+            await handOffQuarantineGuard(quarantinePath, projectDir);
+          }
+          rescanRequired = true;
+        }
+      } catch (error) {
+        if (!isNodeError(error, "ENOENT")) throw error;
+        rescanRequired = true;
+      }
     }
+
+    const quarantineFiles = await listQuarantineFiles(projectDir);
+    for (const name of quarantineFiles) {
+      const path = `${projectDir}/${name}`;
+      let exactMatch = false;
+      try {
+        const inspected = await inspectQuarantine(path);
+        if (!lockArtifactIdentityMatches(inspected, identity)) continue;
+        exactMatch = true;
+        await unlink(path);
+        removed = true;
+      } catch (error) {
+        if (!isNodeError(error, "ENOENT")) throw error;
+        if (exactMatch) rescanRequired = true;
+      }
+    }
+    if (removed) await fsyncDirectory(projectDir);
+    if (removed || rescanRequired) continue;
+    return;
   }
 }
 
-// Verifies that lockFile still resolves to the exact inode we created. Used
-// after the post-creation marker check to detect that a contender's recovery
-// replaced our inode while a marker was active.
-async function lockInodeMatches(
+function lockArtifactIdentityMatches(
+  inspected: InspectedLock,
+  identity: LockArtifactIdentity,
+): boolean {
+  return (
+    inspected.metadata.dev === identity.dev &&
+    inspected.metadata.ino === identity.ino &&
+    inspected.text === identity.text
+  );
+}
+
+async function handOffQuarantineGuard(
+  quarantinePath: string,
+  projectDir: string,
+): Promise<void> {
+  const orphanPath =
+    `${projectDir}/${QUARANTINE_PREFIX}orphan-${randomUUID()}`;
+  await rename(quarantinePath, orphanPath);
+  await fsyncDirectory(projectDir);
+}
+
+// Removes every exact nonce-bearing artifact owned by this acquisition.
+// The fixed path is first moved to a unique quarantine guard and verified
+// there, so a replacement that appears between inspection and rename is
+// restored rather than unlinked. Unique quarantine paths can then be removed
+// by exact payload because legitimate TaskFence processes never reuse them.
+async function removeOwnedLockArtifacts(
   lockFile: string,
-  identity: { dev: number; ino: number },
+  projectDir: string,
+  rootHash: string,
+  staleLockMs: number,
+  payloadText: string,
+): Promise<void> {
+  for (
+    let pass = 0;
+    pass < MAX_OWNED_ARTIFACT_CLEANUP_PASSES;
+    pass += 1
+  ) {
+    let removed = false;
+    let rescanRequired = false;
+    let fixed: InspectedLock | undefined;
+    try {
+      fixed = await inspectLockArtifact(lockFile, "Lock artifact");
+    } catch (error) {
+      if (!isNodeError(error, "ENOENT")) throw error;
+    }
+
+    if (fixed?.text === payloadText) {
+      const quarantinePath =
+        `${projectDir}/${QUARANTINE_PREFIX}${process.pid}-${randomUUID()}`;
+      try {
+        await rename(lockFile, quarantinePath);
+        await fsyncDirectory(projectDir);
+        const moved = await inspectQuarantine(quarantinePath);
+        if (moved.text === payloadText) {
+          await unlink(quarantinePath);
+          await fsyncDirectory(projectDir);
+          removed = true;
+        } else {
+          const restored = await restoreQuarantineToLock(
+            quarantinePath,
+            lockFile,
+            projectDir,
+            rootHash,
+            staleLockMs,
+            moved,
+          );
+          if (restored.kind === "error") throw restored.error;
+          if (restored.kind === "present") {
+            await handOffQuarantineGuard(quarantinePath, projectDir);
+          }
+          rescanRequired = true;
+        }
+      } catch (error) {
+        if (!isNodeError(error, "ENOENT")) throw error;
+        rescanRequired = true;
+      }
+    }
+
+    const quarantineFiles = await listQuarantineFiles(projectDir);
+    for (const name of quarantineFiles) {
+      const path = `${projectDir}/${name}`;
+      let exactMatch = false;
+      try {
+        const inspected = await inspectQuarantine(path);
+        if (inspected.text !== payloadText) continue;
+        exactMatch = true;
+        await unlink(path);
+        removed = true;
+      } catch (error) {
+        if (!isNodeError(error, "ENOENT")) throw error;
+        if (exactMatch) rescanRequired = true;
+      }
+    }
+    if (removed) await fsyncDirectory(projectDir);
+    if (removed || rescanRequired) continue;
+    return;
+  }
+}
+
+// Verifies that lockFile still contains the exact payload we wrote. On Linux,
+// inode numbers can be reused, so dev/ino alone is insufficient.
+async function lockOwnershipMatches(
+  lockFile: string,
+  identity: { dev: number; ino: number; payloadText: string },
 ): Promise<boolean> {
   try {
-    const current = await lstat(lockFile);
-    return current.dev === identity.dev && current.ino === identity.ino;
+    const current = await inspectLock(lockFile);
+    return (
+      current.metadata.dev === identity.dev &&
+      current.metadata.ino === identity.ino &&
+      current.text === identity.payloadText
+    );
   } catch {
     return false;
   }
 }
 
 async function inspectLock(path: string): Promise<InspectedLock> {
+  return inspectLockArtifact(path, "Lock file");
+}
+
+async function inspectLockArtifact(
+  path: string,
+  label: string,
+): Promise<InspectedLock> {
   let handle: FileHandle | undefined;
   try {
     handle = await open(
       path,
-      fsConstants.O_RDONLY |
-        fsConstants.O_NONBLOCK |
-        fsConstants.O_NOFOLLOW,
+      fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
     );
     const metadata = await handle.stat();
     if (
       !metadata.isFile() ||
-      metadata.nlink !== 1 ||
       metadata.size > MAX_LOCK_BYTES ||
       (metadata.mode & 0o777) !== LOCK_FILE_MODE ||
       (typeof process.getuid === "function" && metadata.uid !== process.getuid())
     ) {
       throw new ProjectLockError(
         "LOCK_CORRUPT",
-        `Lock file permissions, ownership, type, or size are unsafe: ${path}`,
+        `${label} permissions, ownership, type, or size are unsafe: ${path}`,
       );
     }
-    const text = await handle.readFile("utf8");
-    return { payload: parseLockPayload(text), metadata };
-  } catch (error) {
-    if (isNodeError(error, "ENOENT")) {
+    // nlink === 0: the file was unlinked between our open and fstat. Treat
+    // this as disappeared (ENOENT), not corruption — the owner legitimately
+    // removed the path while we held the open fd.
+    if (metadata.nlink === 0) {
+      const error = new Error(`File disappeared (nlink=0): ${path}`);
+      (error as NodeJS.ErrnoException).code = "ENOENT";
       throw error;
     }
-    throw new ProjectLockError("LOCK_CORRUPT", `Cannot inspect lock file: ${path}`, {
-      cause: error,
-    });
+    // Bounded protocol aliases: during concurrent restore operations, a lock
+    // inode may be hard-linked as state.lock plus multiple quarantine names
+    // (Q1, Q2, ...). Allow up to MAX_LOCK_ARTIFACT_LINKS (100 Q names + 1
+    // fixed path) rather than treating transient extra links as corruption.
+    if (metadata.nlink > MAX_LOCK_ARTIFACT_LINKS) {
+      throw new ProjectLockError(
+        "LOCK_CORRUPT",
+        `${label} has an unbounded link count (${metadata.nlink}): ${path}`,
+      );
+    }
+    const buffer = Buffer.allocUnsafe(MAX_LOCK_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > MAX_LOCK_BYTES) {
+      throw new ProjectLockError(
+        "LOCK_CORRUPT",
+        `${label} exceeds the size limit: ${path}`,
+      );
+    }
+    const text = buffer.subarray(0, bytesRead).toString("utf8");
+    return { payload: parseLockPayload(text), text, metadata };
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) throw error;
+    if (error instanceof ProjectLockError) throw error;
+    throw new ProjectLockError(
+      "LOCK_CORRUPT",
+      `Cannot inspect ${label.toLowerCase()}: ${path}`,
+      { cause: error },
+    );
   } finally {
     await handle?.close().catch(() => undefined);
   }
@@ -368,318 +628,266 @@ function parseLockPayload(text: string): LockPayload | null {
   }
 }
 
-// Recovers a stale lock under a durable recovery marker. The marker is created
-// atomically (O_EXCL) before state.lock is touched, so any acquirer that
-// observes the marker waits instead of creating a competing lock. Under the
-// marker, the candidate is re-inspected for current payload, mtime, and owner
-// liveness — a lock that was stale when inspected (e.g. empty payload from a
-// creator mid-write) may have become valid by the time the marker is acquired.
-// Only a genuinely stale candidate is quarantined, removed, and the marker
-// cleared after the quarantine directory is fsynced.
+type RecoveryResult =
+  | { kind: "recovered" | "aborted" }
+  | { kind: "error"; error: ProjectLockError };
+
+// Recovers a stale lock by atomically renaming it to a unique quarantine
+// guard. The moved file is verified by inode and raw payload before deletion;
+// a live, fresh, foreign-root, or changed candidate is restored without
+// clobbering any fixed-path contender.
 async function recoverStaleLock(
   lockFile: string,
-  marker: RecoveryMarkerPath,
-  inspected: Stats,
+  projectDir: string,
+  inspected: InspectedLock,
   rootHash: string,
   staleLockMs: number,
-  deadline: number,
-): Promise<
-  | { kind: "recovered" | "aborted" }
-  | { kind: "error"; error: ProjectLockError }
-> {
-  let markerHandle: FileHandle | undefined;
-  let markerCreated = false;
-  let markerIdentity: { dev: number; ino: number } | undefined;
+): Promise<RecoveryResult> {
+  const quarantinePath =
+    `${projectDir}/${QUARANTINE_PREFIX}${process.pid}-${randomUUID()}`;
   try {
-    // Acquire the recovery marker exclusively. If another recovery is already
-    // in progress, abort and let the acquire loop wait for it to clear.
-    const acquired = await acquireRecoveryMarker(marker, rootHash, deadline);
-    if (acquired.kind === "busy" || acquired.kind === "aborted") {
-      return { kind: "aborted" };
-    }
-    if (acquired.kind === "error") {
-      return { kind: "error", error: acquired.error };
-    }
-    markerHandle = acquired.handle;
-    markerIdentity = acquired.identity;
-    markerCreated = true;
+    const snapshotText = inspected.text;
+    const snapshotDev = inspected.metadata.dev;
+    const snapshotIno = inspected.metadata.ino;
 
-    // Re-inspect the candidate under the marker. The original inspection may
-    // have seen an empty/partial payload from a creator mid-write (inode
-    // visible before writeFile+sync). By now that creator may have finished,
-    // making the lock valid and live. Verify inode identity AND current
-    // staleness before removing anything.
-    let currentInspected: InspectedLock;
+    await rename(lockFile, quarantinePath);
+    await fsyncDirectory(projectDir);
+
+    let quarantined: InspectedLock;
     try {
-      currentInspected = await inspectLock(lockFile);
+      quarantined = await inspectQuarantine(quarantinePath);
     } catch (error) {
       if (isNodeError(error, "ENOENT")) return { kind: "aborted" };
       throw error;
     }
     if (
-      currentInspected.metadata.dev !== inspected.dev ||
-      currentInspected.metadata.ino !== inspected.ino
+      quarantined.metadata.dev !== snapshotDev ||
+      quarantined.metadata.ino !== snapshotIno ||
+      quarantined.text !== snapshotText
     ) {
-      // Inode changed: another recovery or contender already resolved it.
-      return { kind: "aborted" };
-    }
-    // Preserve the caller's root-binding rule: a non-null payload bound to a
-    // different canonical root is corrupt, not recoverable — even if its owner
-    // is dead. The initial inspection may have seen an empty file (null
-    // payload) that passed the root check trivially; the current payload read
-    // under the marker may reveal a foreign-root lock.
-    if (
-      currentInspected.payload !== null &&
-      currentInspected.payload.rootHash !== rootHash
-    ) {
-      return {
-        kind: "error",
-        error: new ProjectLockError(
-          "LOCK_CORRUPT",
-          "Project lock is bound to a different canonical root hash",
-        ),
-      };
-    }
-    // Re-check staleness with the current payload and mtime. A lock that is
-    // now valid (non-null payload) and owned by a live process must not be
-    // removed, even if it was empty when first inspected.
-    const currentAgeMs = Math.max(
-      0,
-      Date.now() - currentInspected.metadata.mtimeMs,
-    );
-    const currentOwnerAlive = currentInspected.payload
-      ? isProcessAlive(currentInspected.payload.pid)
-      : false;
-    if (currentAgeMs < staleLockMs || currentOwnerAlive) {
-      return { kind: "aborted" };
-    }
-
-    // Move the candidate into the quarantine path resolved relative to the
-    // marker, then fsync the parent so the rename is durable before any acquirer
-    // observes the cleared marker.
-    const quarantinePath = `${marker.projectDir}/.stale-lock-${process.pid}-${randomUUID()}`;
-    await rename(lockFile, quarantinePath);
-    const quarantined = await lstat(quarantinePath);
-    if (quarantined.dev !== inspected.dev || quarantined.ino !== inspected.ino) {
-      // The rename did not move our candidate (concurrent replace). Restore by
-      // inode identity so we never clobber a contender's fresh lock.
-      await restoreQuarantinedLock(quarantinePath, lockFile);
-      return { kind: "aborted" };
-    }
-
-    await unlink(quarantinePath);
-    return { kind: "recovered" };
-  } catch (error) {
-    if (isNodeError(error, "ENOENT")) {
-      return { kind: "aborted" };
-    }
-    return {
-      kind: "error",
-      error: new ProjectLockError(
-        "LOCK_IO",
-        "Unable to recover stale project lock",
-        { cause: error },
-      ),
-    };
-  } finally {
-    if (markerCreated) {
-      await releaseRecoveryMarker(marker, markerHandle, markerIdentity);
-    } else if (markerHandle !== undefined) {
-      await markerHandle.close().catch(() => undefined);
-    }
-  }
-}
-
-// Restores a quarantined candidate back to state.lock. The recovery marker is
-// held for the entire rename→resolve window, so no contender can create
-// state.lock concurrently; link() therefore recreates the original owner's
-// inode without risk of clobbering a fresh lock.
-async function restoreQuarantinedLock(
-  stalePath: string,
-  lockFile: string,
-): Promise<void> {
-  try {
-    await link(stalePath, lockFile);
-  } catch (error) {
-    if (isNodeError(error, "EEXIST")) {
-      // Should not happen under the marker, but stay fail-safe: drop the
-      // quarantine rather than clobbering an existing lock.
-      await unlink(stalePath).catch(() => undefined);
-      return;
-    }
-    throw error;
-  }
-  await unlink(stalePath);
-}
-
-type MarkerAcquireResult =
-  | {
-      kind: "acquired";
-      handle: FileHandle;
-      identity: { dev: number; ino: number };
-    }
-  | { kind: "busy" }
-  | { kind: "aborted" }
-  | { kind: "error"; error: ProjectLockError };
-
-// Atomically creates the recovery marker via O_EXCL and returns the owning
-// handle plus inode identity. If a marker already exists, a crash-stale one
-// (dead owner) is reclaimed by identity so recovery can proceed; a live one
-// makes this recovery defer to the in-progress owner. The whole resolution is
-// a single bounded loop driven by the acquire deadline.
-async function acquireRecoveryMarker(
-  marker: RecoveryMarkerPath,
-  rootHash: string,
-  deadline: number,
-): Promise<MarkerAcquireResult> {
-  while (Date.now() < deadline) {
-    let handle: FileHandle | undefined;
-    try {
-      handle = await open(
-        marker.path,
-        fsConstants.O_WRONLY |
-          fsConstants.O_CREAT |
-          fsConstants.O_EXCL |
-          fsConstants.O_NONBLOCK |
-          fsConstants.O_NOFOLLOW,
-        RECOVERY_MARKER_MODE,
-      );
-      await handle.chmod(RECOVERY_MARKER_MODE);
-      const metadata = await handle.stat();
-      if (!isSafeRecoveryInode(metadata)) {
-        throw new ProjectLockError(
-          "LOCK_CORRUPT",
-          `New recovery marker inode is unsafe: ${marker.path}`,
-        );
-      }
-      const payload: RecoveryMarkerPayload = {
-        schemaVersion: 1,
+      return abortRecoveryAndRestore(
+        quarantinePath,
+        lockFile,
+        projectDir,
         rootHash,
-        pid: process.pid,
-        nonce: randomUUID(),
-        createdAt: new Date().toISOString(),
-      };
-      await handle.writeFile(`${JSON.stringify(payload)}\n`, "utf8");
-      await handle.sync();
-      return {
-        kind: "acquired",
-        handle,
-        identity: { dev: metadata.dev, ino: metadata.ino },
-      };
-    } catch (error) {
-      if (handle !== undefined) {
-        await handle.close().catch(() => undefined);
-        await unlink(marker.path).catch(() => undefined);
-      }
-      if (!isNodeError(error, "EEXIST")) {
+        staleLockMs,
+        quarantined,
+      );
+    }
+
+    if (quarantined.payload !== null) {
+      if (quarantined.payload.rootHash !== rootHash) {
+        const restored = await restoreQuarantineToLock(
+          quarantinePath,
+          lockFile,
+          projectDir,
+          rootHash,
+          staleLockMs,
+          quarantined,
+        );
+        if (restored.kind === "error") return restored;
         return {
           kind: "error",
           error: new ProjectLockError(
-            "LOCK_IO",
-            `Unable to create recovery marker: ${marker.path}`,
-            { cause: error },
+            "LOCK_CORRUPT",
+            "Project lock is bound to a different canonical root hash",
           ),
         };
       }
-    }
-
-    // A marker already exists. Resolve it: defer to a live owner, or reclaim a
-    // crash-stale one by identity and retry acquisition within the deadline.
-    let inspected: InspectedMarker;
-    try {
-      inspected = await inspectRecoveryMarker(marker, rootHash);
-    } catch (error) {
-      if (isNodeError(error, "ENOENT")) {
-        continue; // Cleared by its owner between the EEXIST and the inspect.
+      if (isProcessAlive(quarantined.payload.pid)) {
+        return abortRecoveryAndRestore(
+          quarantinePath,
+          lockFile,
+          projectDir,
+          rootHash,
+          staleLockMs,
+          quarantined,
+        );
       }
-      if (error instanceof ProjectLockError) {
-        return { kind: "error", error };
-      }
-      return {
-        kind: "error",
-        error: new ProjectLockError(
-          "LOCK_CORRUPT",
-          `Cannot inspect existing recovery marker: ${marker.path}`,
-          { cause: error },
-        ),
-      };
     }
-    if (isProcessAlive(inspected.payload.pid)) {
-      return { kind: "busy" };
+    const currentAgeMs = Math.max(
+      0,
+      Date.now() - quarantined.metadata.mtimeMs,
+    );
+    if (currentAgeMs < staleLockMs) {
+      return abortRecoveryAndRestore(
+        quarantinePath,
+        lockFile,
+        projectDir,
+        rootHash,
+        staleLockMs,
+        quarantined,
+      );
     }
-    if (!(await removeMarkerByIdentity(marker, inspected.metadata))) {
-      continue; // Changed underneath us; re-inspect by looping.
-    }
-  }
-  return { kind: "aborted" };
-}
 
-// Releases the recovery marker: fsync the parent directory so the marker
-// contents are durable, then remove the marker only if it is still the inode
-// we created. A crash before completion leaves a crash-stale marker that a
-// later acquirer reclaims safely by identity.
-async function releaseRecoveryMarker(
-  marker: RecoveryMarkerPath,
-  handle: FileHandle | undefined,
-  identity: { dev: number; ino: number } | undefined,
-): Promise<void> {
-  if (handle !== undefined) {
-    await handle.sync().catch(() => undefined);
-    await handle.close().catch(() => undefined);
-  }
-  await fsyncDirectory(marker.projectDir);
-  if (identity === undefined) {
-    return;
-  }
-  try {
-    const current = await lstat(marker.path);
-    if (current.dev === identity.dev && current.ino === identity.ino) {
-      await unlink(marker.path);
-      await fsyncDirectory(marker.projectDir);
-    }
+    await unlink(quarantinePath);
+    await fsyncDirectory(projectDir);
+    return { kind: "recovered" };
   } catch (error) {
-    if (!isNodeError(error, "ENOENT")) {
-      // Best-effort: a leftover marker is reclaimed as crash-stale later.
-    }
+    if (isNodeError(error, "ENOENT")) return { kind: "aborted" };
+    return {
+      kind: "error",
+      error:
+        error instanceof ProjectLockError
+          ? error
+          : new ProjectLockError(
+              "LOCK_IO",
+              "Unable to recover stale project lock",
+              { cause: error },
+            ),
+    };
   }
 }
 
-async function removeMarkerByIdentity(
-  marker: RecoveryMarkerPath,
-  expected: Stats,
-): Promise<boolean> {
-  try {
-    const current = await lstat(marker.path);
-    if (current.dev !== expected.dev || current.ino !== expected.ino) {
-      return false;
-    }
-    await unlink(marker.path);
-    await fsyncDirectory(marker.projectDir);
-    return true;
-  } catch (error) {
-    if (isNodeError(error, "ENOENT")) return true;
-    return false;
-  }
+async function abortRecoveryAndRestore(
+  quarantinePath: string,
+  lockFile: string,
+  projectDir: string,
+  rootHash: string,
+  staleLockMs: number,
+  inspected: InspectedLock,
+): Promise<RecoveryResult> {
+  const restored = await restoreQuarantineToLock(
+    quarantinePath,
+    lockFile,
+    projectDir,
+    rootHash,
+    staleLockMs,
+    inspected,
+  );
+  return restored.kind === "error" ? restored : { kind: "aborted" };
 }
 
-type MarkerPresence =
+async function inspectQuarantine(path: string): Promise<InspectedLock> {
+  return inspectLockArtifact(path, "Quarantine file");
+}
+
+type QuarantinePresence =
   | { kind: "present" | "absent" }
   | { kind: "error"; error: ProjectLockError };
 
-// Inspects a recovery marker and, if its owner process is dead, removes it by
-// inode identity so a crashed recoverer never permanently blocks acquisition.
-// Returns "cleared" if the marker is absent or was just reclaimed, "present"
-// if a live owner still holds it, or "error" for unsafe/foreign/malformed
-// markers that must never be silently deleted.
-async function reclaimMarkerIfStale(
-  marker: RecoveryMarkerPath,
-  rootHash: string,
-): Promise<MarkerPresence> {
-  let inspected: InspectedMarker;
+async function listQuarantineFiles(projectDir: string): Promise<string[]> {
+  let entries: string[];
   try {
-    inspected = await inspectRecoveryMarker(marker, rootHash);
+    entries = await readdir(projectDir);
   } catch (error) {
-    if (isNodeError(error, "ENOENT")) return { kind: "absent" };
+    if (isNodeError(error, "ENOENT")) return [];
+    throw new ProjectLockError("LOCK_IO", "Cannot scan project directory", {
+      cause: error,
+    });
+  }
+  const quarantineFiles = entries
+    .filter((name) => name.startsWith(QUARANTINE_PREFIX))
+    .sort();
+  const malformed = quarantineFiles.find(
+    (name) => !QUARANTINE_NAME_PATTERN.test(name),
+  );
+  if (malformed !== undefined) {
+    throw new ProjectLockError(
+      "LOCK_CORRUPT",
+      `Malformed quarantine filename: ${malformed}`,
+    );
+  }
+  if (quarantineFiles.length > MAX_QUARANTINE_FILES) {
+    throw new ProjectLockError(
+      "LOCK_CORRUPT",
+      `Too many quarantine files: ${quarantineFiles.length}`,
+    );
+  }
+  return quarantineFiles;
+}
+
+// Extracts the recoverer PID from an active quarantine filename
+// (.stale-lock-<pid>-<uuid>). Orphan handoff names intentionally return null.
+function extractRecovererPid(quarantinePath: string): number | null {
+  const basename = quarantinePath.split("/").pop();
+  if (basename === undefined) return null;
+  const match = basename.match(/^\.stale-lock-([1-9]\d*)-/);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
+// Scans the project directory for quarantine guards. Crash-stale guards are
+// reconciled; any live or fresh guard blocks acquisition.
+async function scanQuarantine(
+  projectDir: string,
+  rootHash: string,
+  staleLockMs: number,
+): Promise<QuarantinePresence> {
+  let quarantineFiles: string[];
+  try {
+    quarantineFiles = await listQuarantineFiles(projectDir);
+  } catch (error) {
+    return {
+      kind: "error",
+      error:
+        error instanceof ProjectLockError
+          ? error
+          : new ProjectLockError(
+              "LOCK_IO",
+              "Cannot scan project directory",
+              { cause: error },
+            ),
+    };
+  }
+  if (quarantineFiles.length === 0) return { kind: "absent" };
+
+  for (const name of quarantineFiles) {
+    const path = `${projectDir}/${name}`;
+    const reconciled = await reconcileQuarantine(
+      path,
+      projectDir,
+      rootHash,
+      staleLockMs,
+    );
+    if (reconciled.kind === "error") {
+      return { kind: "error", error: reconciled.error };
+    }
+    if (reconciled.kind === "present") {
+      return { kind: "present" };
+    }
+  }
+
+  try {
+    const remaining = await listQuarantineFiles(projectDir);
+    return remaining.length > 0 ? { kind: "present" } : { kind: "absent" };
+  } catch (error) {
+    return {
+      kind: "error",
+      error:
+        error instanceof ProjectLockError
+          ? error
+          : new ProjectLockError(
+              "LOCK_IO",
+              "Cannot re-scan project directory",
+              { cause: error },
+            ),
+    };
+  }
+}
+
+type ReconcileResult =
+  | { kind: "cleared" | "present" }
+  | { kind: "error"; error: ProjectLockError };
+
+// Reconciles a single crash-stale quarantine file using this decision tree:
+//   1. Valid same-root, PID-alive: restore via link(Q→state.lock), unlink Q.
+//   2. Valid PID-dead, age < staleLockMs: wait (leave Q present).
+//   3. Valid PID-dead, age >= staleLockMs: delete Q (completed recovery).
+//   4. Payload-null (empty/malformed), fresh: wait; stale: delete.
+//   5. Foreign-root / unsafe metadata: fail closed (LOCK_CORRUPT).
+// If Q+state.lock coexist with identical content: unlink Q (prior restore
+// completed). If different live payload: leave Q present and wait.
+async function reconcileQuarantine(
+  quarantinePath: string,
+  projectDir: string,
+  rootHash: string,
+  staleLockMs: number,
+): Promise<ReconcileResult> {
+  let inspected: InspectedLock;
+  try {
+    inspected = await inspectQuarantine(quarantinePath);
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return { kind: "cleared" };
     if (error instanceof ProjectLockError) {
       return { kind: "error", error };
     }
@@ -687,29 +895,287 @@ async function reclaimMarkerIfStale(
       kind: "error",
       error: new ProjectLockError(
         "LOCK_CORRUPT",
-        `Cannot inspect recovery marker: ${marker.path}`,
+        `Cannot inspect quarantine file: ${quarantinePath}`,
         { cause: error },
       ),
     };
   }
-  if (isProcessAlive(inspected.payload.pid)) {
+  // Check the recoverer PID from the filename. If the recoverer is alive,
+  // this is an active recovery — the quarantine guard blocks all acquirers
+  // regardless of the quarantined lock's own PID or staleness.
+  const recovererPid = extractRecovererPid(quarantinePath);
+  if (recovererPid !== null && isProcessAlive(recovererPid)) {
     return { kind: "present" };
   }
-  // Crash-stale marker: remove it by identity, never a foreign/live inode.
-  const removed = await removeMarkerByIdentity(marker, inspected.metadata);
-  return removed ? { kind: "absent" } : { kind: "present" };
+
+  const ageMs = Math.max(0, Date.now() - inspected.metadata.mtimeMs);
+  const lockFile = `${projectDir}/state.lock`;
+
+  if (inspected.payload !== null) {
+    // Foreign-root quarantine: fail closed.
+    if (inspected.payload.rootHash !== rootHash) {
+      return {
+        kind: "error",
+        error: new ProjectLockError(
+          "LOCK_CORRUPT",
+          "Quarantine file is bound to a different canonical root hash",
+        ),
+      };
+    }
+    // Valid same-root, PID-alive: restore the live owner's lock.
+    if (isProcessAlive(inspected.payload.pid)) {
+      return restoreQuarantineToLock(
+        quarantinePath,
+        lockFile,
+        projectDir,
+        rootHash,
+        staleLockMs,
+        inspected,
+      );
+    }
+    // Valid PID-dead, age < staleLockMs: wait (do not restore a dead owner).
+    if (ageMs < staleLockMs) {
+      return { kind: "present" };
+    }
+    // Valid PID-dead, age >= staleLockMs: delete (recovery completed).
+    await unlink(quarantinePath);
+    await fsyncDirectory(projectDir);
+    return { kind: "cleared" };
+  }
+
+  // Payload-null (empty/malformed): fresh → wait, stale → delete.
+  if (ageMs < staleLockMs) {
+    return { kind: "present" };
+  }
+  await unlink(quarantinePath);
+  await fsyncDirectory(projectDir);
+  return { kind: "cleared" };
 }
 
-// Waits for any existing recovery marker to clear. Acquirers must observe no
-// marker before O_EXCL creation so they never race with a quarantined owner.
-// A crash-stale marker (dead owner) is reclaimed by inode identity here so a
-// crashed recoverer never permanently blocks acquisition. A live owner's
-// marker is never removed. Bounded by the acquire deadline and a hard
-// iteration cap — no unbounded polling.
-async function waitForRecoveryMarkerCleared(
-  marker: RecoveryMarkerPath,
-  deadline: number,
+// Restores a quarantine guard without clobbering a fixed-path contender. A
+// stale dead contender can be cleared while the existing quarantine remains
+// the global guard; live or fresh contenders are left for their owner.
+async function restoreQuarantineToLock(
+  quarantinePath: string,
+  lockFile: string,
+  projectDir: string,
   rootHash: string,
+  staleLockMs: number,
+  inspected: InspectedLock,
+  recoverConflictingLock = true,
+): Promise<ReconcileResult> {
+  let existingLock: InspectedLock | undefined;
+  try {
+    existingLock = await inspectLockArtifact(lockFile, "Lock artifact");
+  } catch (error) {
+    if (!isNodeError(error, "ENOENT")) {
+      return {
+        kind: "error",
+        error:
+          error instanceof ProjectLockError
+            ? error
+            : new ProjectLockError(
+                "LOCK_IO",
+                `Cannot inspect project lock while restoring ${quarantinePath}`,
+                { cause: error },
+              ),
+      };
+    }
+  }
+
+  if (existingLock !== undefined) {
+    if (
+      existingLock.metadata.dev === inspected.metadata.dev &&
+      existingLock.metadata.ino === inspected.metadata.ino &&
+      existingLock.text === inspected.text
+    ) {
+      try {
+        await unlink(quarantinePath);
+        await fsyncDirectory(projectDir);
+      } catch (error) {
+        if (!isNodeError(error, "ENOENT")) {
+          return {
+            kind: "error",
+            error: new ProjectLockError(
+              "LOCK_IO",
+              `Cannot complete quarantine restoration: ${quarantinePath}`,
+              { cause: error },
+            ),
+          };
+        }
+      }
+      return { kind: "cleared" };
+    }
+    if (inspected.metadata.nlink > 1) {
+      return { kind: "present" };
+    }
+    if (!recoverConflictingLock || existingLock.metadata.nlink > 1) {
+      return { kind: "present" };
+    }
+    if (
+      existingLock.payload !== null &&
+      existingLock.payload.rootHash !== rootHash
+    ) {
+      return {
+        kind: "error",
+        error: new ProjectLockError(
+          "LOCK_CORRUPT",
+          "Conflicting project lock is bound to a different canonical root hash",
+        ),
+      };
+    }
+    const ageMs = Math.max(0, Date.now() - existingLock.metadata.mtimeMs);
+    if (
+      (existingLock.payload !== null &&
+        isProcessAlive(existingLock.payload.pid)) ||
+      ageMs < staleLockMs
+    ) {
+      return { kind: "present" };
+    }
+    const cleared = await clearConflictingStaleLock(
+      lockFile,
+      projectDir,
+      rootHash,
+      staleLockMs,
+      existingLock,
+    );
+    if (cleared.kind !== "cleared") return cleared;
+  } else if (inspected.metadata.nlink > 1) {
+    return { kind: "present" };
+  }
+
+  try {
+    await link(quarantinePath, lockFile);
+    await fsyncDirectory(projectDir);
+  } catch (error) {
+    if (isNodeError(error, "EEXIST")) return { kind: "present" };
+    if (isNodeError(error, "ENOENT")) return { kind: "cleared" };
+    return {
+      kind: "error",
+      error: new ProjectLockError(
+        "LOCK_IO",
+        `Cannot restore quarantine file: ${quarantinePath}`,
+        { cause: error },
+      ),
+    };
+  }
+  try {
+    await unlink(quarantinePath);
+    await fsyncDirectory(projectDir);
+  } catch (error) {
+    if (!isNodeError(error, "ENOENT")) {
+      return {
+        kind: "error",
+        error: new ProjectLockError(
+          "LOCK_IO",
+          `Cannot finish restoring quarantine file: ${quarantinePath}`,
+          { cause: error },
+        ),
+      };
+    }
+  }
+  return { kind: "cleared" };
+}
+
+async function clearConflictingStaleLock(
+  lockFile: string,
+  projectDir: string,
+  rootHash: string,
+  staleLockMs: number,
+  inspected: InspectedLock,
+): Promise<ReconcileResult> {
+  const quarantinePath =
+    `${projectDir}/${QUARANTINE_PREFIX}${process.pid}-${randomUUID()}`;
+  try {
+    await rename(lockFile, quarantinePath);
+    await fsyncDirectory(projectDir);
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return { kind: "cleared" };
+    return {
+      kind: "error",
+      error: new ProjectLockError(
+        "LOCK_IO",
+        "Cannot quarantine a conflicting stale lock",
+        { cause: error },
+      ),
+    };
+  }
+
+  let moved: InspectedLock;
+  try {
+    moved = await inspectQuarantine(quarantinePath);
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return { kind: "cleared" };
+    return {
+      kind: "error",
+      error:
+        error instanceof ProjectLockError
+          ? error
+          : new ProjectLockError(
+              "LOCK_IO",
+              "Cannot inspect a conflicting stale lock",
+              { cause: error },
+            ),
+    };
+  }
+
+  const changed =
+    moved.metadata.dev !== inspected.metadata.dev ||
+    moved.metadata.ino !== inspected.metadata.ino ||
+    moved.text !== inspected.text;
+  const foreign =
+    moved.payload !== null && moved.payload.rootHash !== rootHash;
+  const ageMs = Math.max(0, Date.now() - moved.metadata.mtimeMs);
+  const active =
+    (moved.payload !== null && isProcessAlive(moved.payload.pid)) ||
+    ageMs < staleLockMs;
+  if (changed || foreign || active) {
+    const restored = await restoreQuarantineToLock(
+      quarantinePath,
+      lockFile,
+      projectDir,
+      rootHash,
+      staleLockMs,
+      moved,
+      false,
+    );
+    if (restored.kind === "error") return restored;
+    if (foreign) {
+      return {
+        kind: "error",
+        error: new ProjectLockError(
+          "LOCK_CORRUPT",
+          "Conflicting project lock changed to a foreign canonical root",
+        ),
+      };
+    }
+    return { kind: "present" };
+  }
+
+  try {
+    await unlink(quarantinePath);
+    await fsyncDirectory(projectDir);
+    return { kind: "cleared" };
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return { kind: "cleared" };
+    return {
+      kind: "error",
+      error: new ProjectLockError(
+        "LOCK_IO",
+        "Cannot remove a conflicting stale lock",
+        { cause: error },
+      ),
+    };
+  }
+}
+
+// Waits for all quarantine files to be reconciled. Bounded by the acquire
+// deadline and a hard iteration cap — no unbounded polling.
+async function waitForQuarantineCleared(
+  projectDir: string,
+  rootHash: string,
+  staleLockMs: number,
+  deadline: number,
 ): Promise<
   | { kind: "cleared" }
   | { kind: "timeout" }
@@ -717,130 +1183,21 @@ async function waitForRecoveryMarkerCleared(
 > {
   let iterations = 0;
   while (Date.now() < deadline) {
-    if (iterations >= MAX_RECOVERY_MARKER_WAITERS) {
+    if (iterations >= MAX_QUARANTINE_WAITERS) {
       return { kind: "timeout" };
     }
     iterations += 1;
-    const presence = await reclaimMarkerIfStale(marker, rootHash);
+    const presence = await scanQuarantine(projectDir, rootHash, staleLockMs);
     if (presence.kind === "error") {
       return { kind: "error", error: presence.error };
     }
     if (presence.kind === "absent") {
       return { kind: "cleared" };
     }
-    await sleep(Math.min(RECOVERY_MARKER_POLL_MS, Math.max(1, deadline - Date.now())));
+    await sleep(Math.min(QUARANTINE_POLL_MS, Math.max(1, deadline - Date.now())));
   }
   return { kind: "timeout" };
 }
-
-async function inspectRecoveryMarker(
-  marker: RecoveryMarkerPath,
-  rootHash: string,
-): Promise<InspectedMarker> {
-  let handle: FileHandle | undefined;
-  try {
-    handle = await open(
-      marker.path,
-      fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
-    );
-    const metadata = await handle.stat();
-    if (
-      !isSafeRecoveryInode(metadata) ||
-      metadata.size > MAX_MARKER_BYTES
-    ) {
-      throw new ProjectLockError(
-        "LOCK_CORRUPT",
-        `Recovery marker is unsafe: ${marker.path}`,
-      );
-    }
-    const text = await handle.readFile("utf8");
-    const payload = parseRecoveryMarkerPayload(text);
-    if (payload === null) {
-      throw new ProjectLockError(
-        "LOCK_CORRUPT",
-        `Recovery marker payload is invalid: ${marker.path}`,
-      );
-    }
-    if (rootHash.length > 0 && payload.rootHash !== rootHash) {
-      throw new ProjectLockError(
-        "LOCK_CORRUPT",
-        "Recovery marker is bound to a different canonical root hash",
-      );
-    }
-    return { payload, metadata };
-  } catch (error) {
-    if (isNodeError(error, "ENOENT")) {
-      throw error;
-    }
-    if (error instanceof ProjectLockError) {
-      throw error;
-    }
-    throw new ProjectLockError(
-      "LOCK_CORRUPT",
-      `Cannot inspect recovery marker: ${marker.path}`,
-      { cause: error },
-    );
-  } finally {
-    await handle?.close().catch(() => undefined);
-  }
-}
-
-function parseRecoveryMarkerPayload(text: string): RecoveryMarkerPayload | null {
-  try {
-    const value: unknown = JSON.parse(text);
-    if (
-      !isRecord(value) ||
-      !hasExactKeys(value, [
-        "schemaVersion",
-        "rootHash",
-        "pid",
-        "nonce",
-        "createdAt",
-      ]) ||
-      value.schemaVersion !== 1 ||
-      typeof value.rootHash !== "string" ||
-      !/^[a-f0-9]{64}$/.test(value.rootHash) ||
-      !Number.isSafeInteger(value.pid) ||
-      (value.pid as number) <= 0 ||
-      typeof value.nonce !== "string" ||
-      value.nonce.length === 0 ||
-      typeof value.createdAt !== "string" ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.createdAt) ||
-      !Number.isFinite(Date.parse(value.createdAt))
-    ) {
-      return null;
-    }
-    return value as unknown as RecoveryMarkerPayload;
-  } catch {
-    return null;
-  }
-}
-
-function isSafeRecoveryInode(metadata: Stats): boolean {
-  return (
-    metadata.isFile() &&
-    metadata.nlink === 1 &&
-    (metadata.mode & 0o777) === RECOVERY_MARKER_MODE &&
-    (typeof process.getuid !== "function" || metadata.uid === process.getuid())
-  );
-}
-
-async function fsyncDirectory(directory: string): Promise<void> {
-  let handle: FileHandle | undefined;
-  try {
-    handle = await open(
-      directory,
-      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
-    );
-    await handle.sync();
-  } catch {
-    // Directory fsync is best-effort for durability; a missing or unsupported
-    // sync never creates a concurrent owner (O_EXCL + marker protocol still hold).
-  } finally {
-    await handle?.close().catch(() => undefined);
-  }
-}
-
 
 function startHeartbeat(
   lockFile: string,
@@ -867,23 +1224,6 @@ function startHeartbeat(
   return heartbeat;
 }
 
-async function releaseOwnedLock(
-  lockFile: string,
-  payload: LockPayload,
-): Promise<void> {
-  try {
-    const inspected = await inspectLock(lockFile);
-    if (inspected.payload?.nonce === payload.nonce) {
-      await unlink(lockFile);
-    }
-  } catch (error) {
-    if (!isNodeError(error, "ENOENT")) {
-      throw new ProjectLockError("LOCK_IO", "Unable to release project lock", {
-        cause: error,
-      });
-    }
-  }
-}
 
 function isProcessAlive(pid: number): boolean {
   try {
@@ -928,3 +1268,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+async function fsyncDirectory(directory: string): Promise<void> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(directory, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    await handle.sync();
+  } catch {
+    // Directory fsync is best-effort for durability; a missing or unsupported
+    // sync never creates a concurrent owner (quarantine protocol still holds).
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
