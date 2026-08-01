@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## 0.1.2 - 2026-08-01
+## 0.1.3 - 2026-08-01
 
 ### Fixed
 
@@ -13,9 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Claude Code auto-discovers that standard path; declaring it again caused the
   installed plugin to report a duplicate-hooks load error.
 - Claude Code can now make repeated native Plan Mode writes to the same
-  session-bound plan path. Pre-existing, cross-session, symlinked, hard-linked,
-  non-regular, wrong-owner, and group- or other-writable destinations remain
-  fail-closed.
+  session-bound plan path, and an exact successful write-post retry is
+  idempotent. Pre-existing, competing, cross-project, cross-session,
+  case- or Unicode-aliased, symlinked, hard-linked, non-regular, wrong-owner,
+  and group- or other-writable destinations remain fail-closed.
 - Approval checkpoint completion is bound to the exact staged revision and
   generation, so a stale concurrent attempt cannot overwrite a revoked and
   restarted approval.

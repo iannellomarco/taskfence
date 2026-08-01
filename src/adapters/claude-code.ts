@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants, type Stats } from "node:fs";
-import { lstat, open, realpath, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -60,6 +60,7 @@ const MAX_SHORT_FIELD_LENGTH = 1_024;
 const CLAUDE_APPROVAL_FILE_MODE = 0o600;
 const MAX_CLAUDE_APPROVAL_BYTES = 16 * 1024;
 const CLAUDE_PLAN_BINDING_CALL_ID = "plan-binding-v1";
+const CLAUDE_PLAN_CLAIMS_DIRECTORY = ".taskfence-plan-claims";
 const CLAUDE_APPROVAL_KEYS = [
   "callId",
   "planHash",
@@ -421,19 +422,75 @@ async function claudePlanWriteLocation(
   };
 }
 
+async function claudePlanClaimsDirectory(planPath: string): Promise<string> {
+  const plansDirectory = await realpath(dirname(planPath));
+  const claimsDirectory = join(
+    plansDirectory,
+    CLAUDE_PLAN_CLAIMS_DIRECTORY,
+  );
+  let created = false;
+  try {
+    await mkdir(claimsDirectory, { mode: 0o700 });
+    created = true;
+  } catch (error) {
+    if (!isNodeError(error, "EEXIST")) throw error;
+  }
+  if (created) await chmod(claimsDirectory, 0o700);
+
+  const metadata = await lstat(claimsDirectory);
+  if (
+    !metadata.isDirectory() ||
+    (metadata.mode & 0o777) !== 0o700 ||
+    (typeof process.getuid === "function" &&
+      metadata.uid !== process.getuid())
+  ) {
+    throw new ClaudeHookInputError(
+      `Claude plan claim directory is unsafe: ${claimsDirectory}`,
+    );
+  }
+  const canonicalClaimsDirectory = await realpath(claimsDirectory);
+  if (dirname(canonicalClaimsDirectory) !== plansDirectory) {
+    throw new ClaudeHookInputError(
+      `Claude plan claim directory escapes the plans directory: ${claimsDirectory}`,
+    );
+  }
+  if (created) {
+    const parentHandle = await open(
+      plansDirectory,
+      fsConstants.O_RDONLY |
+        fsConstants.O_NOFOLLOW |
+        fsConstants.O_NONBLOCK,
+    );
+    try {
+      const parentMetadata = await parentHandle.stat();
+      if (
+        !parentMetadata.isDirectory() ||
+        (parentMetadata.mode & 0o022) !== 0 ||
+        (typeof process.getuid === "function" &&
+          parentMetadata.uid !== process.getuid())
+      ) {
+        throw new ClaudeHookInputError(
+          `Claude's plans directory is not safely owned: ${plansDirectory}`,
+        );
+      }
+      await parentHandle.sync();
+    } finally {
+      await parentHandle.close();
+    }
+  }
+  return canonicalClaimsDirectory;
+}
+
 async function claudePlanBindingLocation(
   payload: ClaudeToolHookPayload,
+  planPath: string,
 ): Promise<ClaudeCorrelationLocation> {
-  const layout = await stateLayout(payload.cwd);
-  const key = createHash("sha256")
-    .update("plan-binding", "utf8")
-    .update("\0", "utf8")
-    .update(payload.sessionId, "utf8")
-    .digest("hex");
+  const root = await canonicalStateRoot(payload.cwd);
+  const claimsDirectory = await claudePlanClaimsDirectory(planPath);
   return {
-    path: join(layout.projectDir, `.claude-plan-binding-${key}.json`),
-    projectDirectory: layout.projectDir,
-    root: layout.canonicalRoot,
+    path: join(claimsDirectory, basename(planPath)),
+    projectDirectory: claimsDirectory,
+    root,
   };
 }
 
@@ -657,35 +714,11 @@ async function validateBoundClaudePlanFile(planPath: string): Promise<void> {
   }
 }
 
-async function syncClaudePlansDirectory(planPath: string): Promise<void> {
-  const canonicalDirectory = await realpath(dirname(planPath));
-  const handle = await open(
-    canonicalDirectory,
-    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
-  );
-  try {
-    const metadata = await handle.stat();
-    if (
-      !metadata.isDirectory() ||
-      (metadata.mode & 0o022) !== 0 ||
-      (typeof process.getuid === "function" &&
-        metadata.uid !== process.getuid())
-    ) {
-      throw new ClaudeHookInputError(
-        `Claude's plans directory is not safely owned: ${canonicalDirectory}`,
-      );
-    }
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
 async function verifyClaudePlanBinding(
   payload: ClaudeToolHookPayload,
   planPath: string,
 ): Promise<void> {
-  const location = await claudePlanBindingLocation(payload);
+  const location = await claudePlanBindingLocation(payload, planPath);
   await verifyClaudeApproval(
     location,
     planBindingPayload(payload),
@@ -699,13 +732,28 @@ async function reserveClaudePlanPath(
   payload: ClaudeToolHookPayload,
   planPath: string,
 ): Promise<void> {
-  const location = await claudePlanBindingLocation(payload);
+  const location = await claudePlanBindingLocation(payload, planPath);
+  let bindingExists = true;
   try {
     await lstat(location.path);
-    await verifyClaudePlanBinding(payload, planPath);
-    return;
   } catch (error) {
     if (!isNodeError(error, "ENOENT")) throw error;
+    bindingExists = false;
+  }
+
+  if (bindingExists) {
+    await verifyClaudeApproval(
+      location,
+      planBindingPayload(payload),
+      planPathHash(planPath),
+      "Claude's native plan path is already bound to another root session",
+    );
+    try {
+      await validateBoundClaudePlanFile(planPath);
+    } catch (error) {
+      if (!isNodeError(error, "ENOENT")) throw error;
+    }
+    return;
   }
 
   try {
@@ -717,47 +765,11 @@ async function reserveClaudePlanPath(
     if (!isNodeError(error, "ENOENT")) throw error;
   }
 
-  const requirements = {
-    mode: CLAUDE_APPROVAL_FILE_MODE,
-    maxBytes: MAX_PLAN_BYTES,
-    label: "Claude native plan reservation",
-  };
-  const created = await createSecureFile(
-    planPath,
-    fsConstants.O_WRONLY,
-    requirements,
+  await stageClaudeApproval(
+    location,
+    planBindingPayload(payload),
+    planPathHash(planPath),
   );
-  let closed = false;
-  try {
-    await created.handle.sync();
-    await created.handle.close();
-    closed = true;
-    await syncClaudePlansDirectory(planPath);
-    await stageClaudeApproval(
-      location,
-      planBindingPayload(payload),
-      planPathHash(planPath),
-    );
-  } catch (error) {
-    if (!closed) await created.handle.close().catch(() => undefined);
-    await unlink(planPath).catch(() => undefined);
-    await syncClaudePlansDirectory(planPath).catch(() => undefined);
-    throw error;
-  }
-}
-
-async function boundClaudePlanFileIsEmpty(planPath: string): Promise<boolean> {
-  const handle = await open(
-    planPath,
-    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
-  );
-  try {
-    const metadata = await handle.stat();
-    validateClaudePlanMetadata(planPath, metadata);
-    return metadata.size === 0;
-  } finally {
-    await handle.close();
-  }
 }
 
 async function stageClaudePlanWrite(
@@ -779,8 +791,20 @@ async function stageClaudePlanWrite(
     if (
       existing.root !== location.root ||
       existing.sessionId !== payload.sessionId ||
-      !(await boundClaudePlanFileIsEmpty(planPath))
+      existing.callId === payload.toolUseId
     ) {
+      throw error;
+    }
+    try {
+      await validateBoundClaudePlanFile(planPath);
+      const observedPlan = await readBoundedPlanFile(planPath);
+      if (
+        createHash("sha256").update(observedPlan, "utf8").digest("hex") !==
+          existing.planHash
+      ) {
+        throw error;
+      }
+    } catch {
       throw error;
     }
   }
@@ -949,7 +973,6 @@ async function runPostToolUse(
         "Written Claude plan file does not match its pre-tool input",
       );
     }
-    await removeClaudeCorrelation(reservation);
     return silentSuccess();
   }
 

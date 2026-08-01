@@ -67,7 +67,9 @@ hook boundary of a supported coding agent. Within that boundary it provides:
   allowed and project mutations/commands are denied. The Claude Code adapter
   has one pre-engine exception: while the host reports Plan Mode, it defers only
   Claude Code's bounded native plan-file write to the host's own gate. The first
-  destination is created exclusively and bound to the root host session; later
+  destination must be absent and is claimed by its basename in a safe hidden
+  directory on the same plans filesystem, which arbitrates case and Unicode
+  aliases while the record binds the canonical root and host session. Later
   writes must reuse that binding, and the safe default plans directory must
   resolve outside the project. That write grants no project authority. Project
   mutations and commands require an active contract and bound host authority.

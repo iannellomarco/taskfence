@@ -1,5 +1,6 @@
 import {
   link,
+  lstat,
   mkdir,
   mkdtemp,
   realpath,
@@ -232,6 +233,7 @@ describe("Claude Code adapter", () => {
 
     const planFilePre = await runClaudeHook(planFilePrePayload);
     expect(planFilePre).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+    await expect(lstat(planPath)).rejects.toMatchObject({ code: "ENOENT" });
     await writeFile(planPath, plan);
     const planFilePostPayload = {
       ...claudePayload(
@@ -245,6 +247,37 @@ describe("Claude Code adapter", () => {
     };
     const planFilePost = await runClaudeHook(planFilePostPayload);
     expect(planFilePost).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+    expect(await runClaudeHook(planFilePostPayload)).toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+
+    const revisionPrePayload = claudePayload(
+      "PreToolUse",
+      "Write",
+      planFileInput,
+      "claude-plan-file-revision",
+    );
+    revisionPrePayload.permission_mode = "plan";
+    expect(await runClaudeHook(revisionPrePayload)).toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+    await writeFile(planPath, plan);
+    expect(
+      await runClaudeHook({
+        ...claudePayload(
+          "PostToolUse",
+          "Write",
+          planFileInput,
+          "claude-plan-file-revision",
+        ),
+        permission_mode: "plan",
+        tool_response: { filePath: planPath },
+      }),
+    ).toEqual({ exitCode: 0, stdout: "", stderr: "" });
 
     const pre = await runClaudeHook(
       claudePayload("PreToolUse", "ExitPlanMode", {
@@ -493,10 +526,10 @@ describe("Claude Code adapter", () => {
       "claude-conflicting-plan-reservation",
     );
     conflictingReservation.permission_mode = "plan";
-    expect(await runClaudeHook(conflictingReservation)).toEqual({
-      exitCode: 0,
-      stdout: "",
-      stderr: "",
+    expect(parsedStdout(await runClaudeHook(conflictingReservation))).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+      },
     });
 
     await writeFile(reservedPlanPath, contractPlan());
@@ -509,7 +542,7 @@ describe("Claude Code adapter", () => {
             file_path: reservedPlanPath,
             content: contractPlan(),
           },
-          "claude-conflicting-plan-reservation",
+          "claude-first-plan-reservation",
         ),
         permission_mode: "plan",
         tool_response: { filePath: reservedPlanPath },
@@ -530,7 +563,9 @@ describe("Claude Code adapter", () => {
     expect(parsedStdout(await runClaudeHook(otherSession))).toMatchObject({
       hookSpecificOutput: {
         permissionDecision: "deny",
-        permissionDecisionReason: expect.stringMatching(/fresh file/u),
+        permissionDecisionReason: expect.stringMatching(
+          /bound to another root session/u,
+        ),
       },
     });
 
@@ -551,6 +586,114 @@ describe("Claude Code adapter", () => {
         permissionDecision: "deny",
       },
     });
+  });
+
+  it("serializes native plan path claims across project roots", async () => {
+    const planPath = join(claudePlansDirectory, "cross-project-plan.md");
+    const first = claudePayload(
+      "PreToolUse",
+      "Write",
+      {
+        file_path: planPath,
+        content: contractPlan(),
+      },
+      "claude-first-project-plan",
+    );
+    first.permission_mode = "plan";
+    expect(await runClaudeHook(first)).toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+    await expect(lstat(planPath)).rejects.toMatchObject({ code: "ENOENT" });
+
+    let otherRoot = join(temporaryDirectory, "other-project");
+    await mkdir(otherRoot);
+    otherRoot = await realpath(otherRoot);
+    const competing = claudePayload(
+      "PreToolUse",
+      "Write",
+      {
+        file_path: planPath,
+        content: contractPlan(),
+      },
+      "claude-other-project-plan",
+    );
+    competing.cwd = otherRoot;
+    competing.session_id = "other-project-session";
+    competing.permission_mode = "plan";
+
+    expect(parsedStdout(await runClaudeHook(competing))).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+        permissionDecisionReason: expect.stringMatching(
+          /bound to another root session/u,
+        ),
+      },
+    });
+    await expect(lstat(planPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("uses the plans filesystem identity for case-aliased claims", async () => {
+    const probe = join(claudePlansDirectory, "TaskFenceCaseProbe");
+    const probeAlias = join(claudePlansDirectory, "taskfencecaseprobe");
+    await writeFile(probe, "probe");
+    let aliasesByCase = false;
+    try {
+      await lstat(probeAlias);
+      aliasesByCase = true;
+    } catch (error) {
+      expect(error).toMatchObject({ code: "ENOENT" });
+    }
+    await rm(probe);
+
+    const firstPath = join(claudePlansDirectory, "Case-Alias-Plan.md");
+    const aliasPath = join(claudePlansDirectory, "case-alias-plan.md");
+    const first = claudePayload(
+      "PreToolUse",
+      "Write",
+      {
+        file_path: firstPath,
+        content: contractPlan(),
+      },
+      "claude-case-first",
+    );
+    first.permission_mode = "plan";
+    expect(await runClaudeHook(first)).toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+
+    let otherRoot = join(temporaryDirectory, "case-alias-project");
+    await mkdir(otherRoot);
+    otherRoot = await realpath(otherRoot);
+    const competing = claudePayload(
+      "PreToolUse",
+      "Write",
+      {
+        file_path: aliasPath,
+        content: contractPlan(),
+      },
+      "claude-case-competing",
+    );
+    competing.cwd = otherRoot;
+    competing.session_id = "case-alias-session";
+    competing.permission_mode = "plan";
+    const result = await runClaudeHook(competing);
+
+    if (aliasesByCase) {
+      expect(parsedStdout(result)).toMatchObject({
+        hookSpecificOutput: {
+          permissionDecision: "deny",
+          permissionDecisionReason: expect.stringMatching(
+            /bound to another root session/u,
+          ),
+        },
+      });
+    } else {
+      expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+    }
   });
 
   it("does not exempt a Claude plan directory inside the project", async () => {
