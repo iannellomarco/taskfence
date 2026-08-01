@@ -27,6 +27,7 @@ You do not need to write the contract yourself. The included setup skill prepare
 - Claude Code with plugin support
 - Node.js 20 or newer (`node --version` shows your installed version)
 - macOS or Linux
+- Claude Code's default plan directory; custom `plansDirectory` settings are not supported in TaskFence 0.1.1
 
 ### 1. Add and install the plugin
 
@@ -45,7 +46,7 @@ When Claude Code asks for an installation scope, choose **Local** for your first
 The plugin runs its hooks from the bundled artifact. Claude Code's direct `!` shell does not inherit plugin executables on `PATH`, so install the matching CLI once for the user-only status, completion, and rollback commands below:
 
 ```text
-!npm install --global https://github.com/iannellomarco/taskfence/archive/refs/tags/v0.1.0.tar.gz
+!npm install --global https://github.com/iannellomarco/taskfence/archive/refs/tags/v0.1.1.tar.gz
 !taskfence status --root .
 ```
 
@@ -59,8 +60,8 @@ The status command must print a TaskFence state block. The leading `!` runs thes
 
 The setup skill will:
 
-1. inspect the project using read-only tools;
-2. enter Plan Mode;
+1. enter Plan Mode;
+2. inspect the project using read-only tools;
 3. write a normal implementation plan;
 4. add the exact TaskFence contract for that task; and
 5. show Claude Code's normal approval screen.
@@ -74,7 +75,8 @@ If you run `/taskfence:setup` without a task, it will ask what you want Claude t
 | Claude wants to… | What TaskFence does |
 | --- | --- |
 | Read or search the project | Allows known read-only tools |
-| Edit, create, delete, or rename a file | Checks every affected path against the approved task |
+| Write Claude Code's native plan in Plan Mode | Defers only the host-managed plan file, physically outside the project, to Claude Code's own gate; it grants no project authority |
+| Edit, create, delete, or rename a project file | Checks every affected path against the approved task |
 | Run a shell command | Requires the exact command arguments and working directory from the approved task |
 | Use an unknown or malformed tool call | Denies it instead of guessing |
 | Continue after a failed or mismatched change | Stops later mutations and requires recovery |

@@ -64,7 +64,11 @@ hook boundary of a supported coding agent. Within that boundary it provides:
   that are explicitly protected. The contract body is strict JSON behind a
   `taskfence-contract` fence; unknown or duplicate keys are rejected.
 - **Read-only tolerance**: when no contract is active, read-only tool calls are
-  allowed and mutations/commands are denied. Mutations and commands require an
+  allowed and project mutations/commands are denied. The Claude Code adapter
+  has one pre-engine exception: while the host reports Plan Mode, it defers only
+  Claude Code's bounded native plan-file write to the host's own gate, and only
+  when its directory and destination resolve safely outside the project. That
+  write grants no project authority. Project mutations and commands require an
   active contract and bound host authority.
 - **Checkpoint before activation**: before a contract becomes active, a
   checkpoint of the project tree is staged and committed so the work can be

@@ -10,7 +10,7 @@
       "displayName": "TaskFence",
       "source": "./",
       "description": "Deterministic, hook-enforced task contracts for Claude Code coding agents",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": {
         "name": "Marco Iannello"
       },

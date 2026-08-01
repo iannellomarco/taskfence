@@ -15,14 +15,20 @@ import {
   type PreToolCallInput,
 } from "../engine.js";
 
+interface ArgumentCarrier {
+  readonly args: unknown;
+}
+
 interface PendingCorrelation {
   readonly inputHash: string;
+  readonly argumentCarrier: ArgumentCarrier;
   readonly root: string;
   readonly toolName: string;
 }
 
 interface PendingPlanCorrelation {
   readonly contractHash: string;
+  readonly argumentCarrier: ArgumentCarrier;
   readonly generation: number;
   readonly planHash: string;
   readonly revision: number;
@@ -148,6 +154,7 @@ export const TaskFencePlugin: Plugin = async ({ directory, client }) => {
           );
         }
         pendingPlans.set(key, {
+          argumentCarrier: output,
           contractHash: state.contract.contractHash,
           generation: state.generation,
           planHash: compiled.planHash,
@@ -173,6 +180,7 @@ export const TaskFencePlugin: Plugin = async ({ directory, client }) => {
 
       if (result.inputHash !== null) {
         pendingCalls.set(JSON.stringify([input.sessionID, input.callID]), {
+          argumentCarrier: output,
           inputHash: result.inputHash,
           root: result.root,
           toolName: input.tool,
@@ -188,7 +196,19 @@ export const TaskFencePlugin: Plugin = async ({ directory, client }) => {
           throw new Error("TaskFence plan_exit completion has no matching preflight");
         }
         pendingPlans.delete(key);
-        const observed = compileContract(requirePlan(input.args), projectRoot);
+        const observedArgs =
+          "args" in input ? input.args : expected.argumentCarrier.args;
+        if (
+          typeof observedArgs !== "object" ||
+          observedArgs === null ||
+          Array.isArray(observedArgs)
+        ) {
+          throw new Error("TaskFence plan_exit completion has invalid arguments");
+        }
+        const observed = compileContract(
+          requirePlan(observedArgs as Record<string, unknown>),
+          projectRoot,
+        );
         if (
           observed.planHash !== expected.planHash ||
           observed.root !== expected.root
@@ -216,10 +236,15 @@ export const TaskFencePlugin: Plugin = async ({ directory, client }) => {
       if (pending === undefined) return;
       pendingCalls.delete(key);
 
+      // Older supported after-hooks identify the call without repeating its
+      // arguments. Retain the mutable before-hook carrier so later plugins
+      // cannot substitute arguments without changing the post hash.
+      const observedArgs =
+        "args" in input ? input.args : pending.argumentCarrier.args;
       const inputHash = hashRawToolCall({
         runtime: "opencode",
         toolName: input.tool,
-        input: input.args,
+        input: observedArgs,
         cwd: projectRoot,
         sessionId: input.sessionID,
         callId: input.callID,

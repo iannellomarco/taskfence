@@ -143,7 +143,6 @@ var JsonDuplicateKeyScanner = class {
   constructor(source) {
     this.source = source;
   }
-  source;
   offset = 0;
   scan() {
     this.skipWhitespace();

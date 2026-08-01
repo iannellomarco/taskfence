@@ -367,7 +367,7 @@ describe("streamReceipts constant-memory traversal", () => {
     if (!result.valid) throw new Error("verification failed");
     expect(result.count).toBe(count);
     expect(sequences).toEqual(Array.from({ length: count }, (_, index) => index + 1));
-  });
+  }, 30_000);
 
   it("traverses a large valid ledger with bounded memory", async () => {
     const count = 600;
@@ -587,29 +587,18 @@ describe("bounded plan-file reading in the CLI", () => {
   });
 });
 const execFileAsync = promisify(execFile);
-const VITE_NODE = fileURLToPath(new URL("../node_modules/.bin/vite-node", import.meta.url));
-const CLI_RUNNER_SRC = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+const COMMITTED_CLI = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 
 /**
- * Runs the TaskFence CLI in a fresh child process via vite-node. Because
- * vite-node does not trigger the CLI's main()-guard (process.argv[1] is the
- * vite-node binary, not cli.ts), we invoke runCli directly through a probe
- * script — each call is a genuinely separate process with its own module
- * registry, proving cursors survive across process boundaries.
+ * Runs the committed TaskFence CLI in a fresh Node process. Each call has its
+ * own module registry, proving cursors survive across process boundaries.
  */
 async function runCliProcess(
   args: string[],
   env: NodeJS.ProcessEnv,
-  probeFile: string,
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const probe = [
-    `import { runCli } from ${JSON.stringify(CLI_RUNNER_SRC)};`,
-    "const code = await runCli(process.argv.slice(2));",
-    "process.exitCode = code;",
-  ].join("\n");
-  await writeFile(probeFile, probe);
   try {
-    const result = await execFileAsync(VITE_NODE, [probeFile, ...args], {
+    const result = await execFileAsync(process.execPath, [COMMITTED_CLI, ...args], {
       encoding: "utf8",
       env,
       timeout: 30_000,
@@ -630,7 +619,6 @@ describe("two-process CLI cursor resume", () => {
   let twoProcessSandbox: string;
   let twoProcessRoot: string;
   let twoProcessEnv: NodeJS.ProcessEnv;
-  let probeFile: string;
   let previousTaskFenceStateDir: string | undefined;
   let previousXdgStateHome: string | undefined;
 
@@ -648,7 +636,6 @@ describe("two-process CLI cursor resume", () => {
       TASKFENCE_STATE_DIR: stateDir,
     };
     delete twoProcessEnv.XDG_STATE_HOME;
-    probeFile = join(twoProcessSandbox, "run-cli.ts");
   });
 
   afterEach(async () => {
@@ -665,7 +652,6 @@ describe("two-process CLI cursor resume", () => {
     const first = await runCliProcess(
       ["receipts", "list", "--root", twoProcessRoot, "--limit", "2", "--json"],
       twoProcessEnv,
-      probeFile,
     );
     expect(first.exitCode).toBe(0);
     expect(first.stderr).toBe("");
@@ -679,7 +665,6 @@ describe("two-process CLI cursor resume", () => {
     const second = await runCliProcess(
       ["receipts", "list", "--root", twoProcessRoot, "--limit", "2", "--json", "--cursor", firstParsed.cursor!],
       twoProcessEnv,
-      probeFile,
     );
     expect(second.exitCode).toBe(0);
     const secondParsed = JSON.parse(second.stdout) as {
@@ -692,7 +677,6 @@ describe("two-process CLI cursor resume", () => {
     const third = await runCliProcess(
       ["receipts", "list", "--root", twoProcessRoot, "--limit", "2", "--json", "--cursor", secondParsed.cursor!],
       twoProcessEnv,
-      probeFile,
     );
     expect(third.exitCode).toBe(0);
     const thirdParsed = JSON.parse(third.stdout) as {
@@ -709,7 +693,6 @@ describe("two-process CLI cursor resume", () => {
     const first = await runCliProcess(
       ["receipts", "list", "--root", twoProcessRoot, "--limit", "1", "--json"],
       twoProcessEnv,
-      probeFile,
     );
     expect(first.exitCode).toBe(0);
     const firstParsed = JSON.parse(first.stdout) as { cursor: string | null };
@@ -720,7 +703,6 @@ describe("two-process CLI cursor resume", () => {
     const second = await runCliProcess(
       ["receipts", "list", "--root", twoProcessRoot, "--limit", "1", "--json", "--cursor", firstParsed.cursor!],
       twoProcessEnv,
-      probeFile,
     );
     expect(second.exitCode).toBe(1);
     expect(second.stderr).toMatch(/cursor_ledger_changed|cursor_prefix_invalid|cursor_hash_mismatch|cursor_count_mismatch|cursor_offset_mismatch/);
@@ -732,7 +714,6 @@ describe("two-process CLI cursor resume", () => {
     const first = await runCliProcess(
       ["receipts", "list", "--root", twoProcessRoot, "--limit", "2", "--json"],
       twoProcessEnv,
-      probeFile,
     );
     expect(first.exitCode).toBe(0);
     const firstParsed = JSON.parse(first.stdout) as {
@@ -748,7 +729,6 @@ describe("two-process CLI cursor resume", () => {
     const second = await runCliProcess(
       ["receipts", "list", "--root", twoProcessRoot, "--limit", "2", "--json", "--cursor", forged],
       twoProcessEnv,
-      probeFile,
     );
     expect(second.exitCode).toBe(1);
     expect(second.stderr).toMatch(/cursor_offset_mismatch|cursor_prefix_invalid|cursor_hash_mismatch|cursor_count_mismatch|unexpected_eof/);

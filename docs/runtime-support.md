@@ -1,10 +1,10 @@
 # Runtime Support
 
-TaskFence 0.1.0 contains adapters and installers for five coding-agent runtimes. “Implemented” below means the adapter matches the current TaskFence source and the cited host API was source-verified on 2026-07-31. It does not mean that `taskfence doctor` can prove end-to-end enforcement; doctor deliberately does not make that claim.
+TaskFence 0.1.1 contains adapters and installers for five coding-agent runtimes. “Implemented” below means the adapter matches the current TaskFence source and the cited host API was source-verified on 2026-08-01. It does not mean that `taskfence doctor` can prove end-to-end enforcement; doctor deliberately does not make that claim.
 
 ## Compatibility targets
 
-| Runtime | Source-verified host target (2026-07-31) | Implemented gate | Contract activation |
+| Runtime | Source-verified host target (2026-08-01) | Implemented gate | Contract activation |
 | --- | --- | --- | --- |
 | Claude Code | `@anthropic-ai/claude-code` 2.1.220 | synchronous catch-all `PreToolUse` and `PostToolUse` command hooks | native `ExitPlanMode`: pre validates and returns `ask`; successful post activates the exact host-approved plan |
 | Codex CLI | `@openai/codex` 0.146.0, tag `rust-v0.146.0` (`e363b08`) | native catch-all `PreToolUse` and `PostToolUse` command hooks | external `taskfence approve`; no native plan-exit activation in the current adapter |
@@ -16,7 +16,7 @@ TaskFence's standalone CLI declares Node.js 20 or newer. That does not lower hos
 
 ## Installation
 
-Install the pinned CLI with `npm install --global https://github.com/iannellomarco/taskfence/archive/refs/tags/v0.1.0.tar.gz`, or build it from the source checkout as described in the [README](../README.md#install-from-source). The CLI supports the same surface for every adapter:
+Install the pinned CLI with `npm install --global https://github.com/iannellomarco/taskfence/archive/refs/tags/v0.1.1.tar.gz`, or build it from the source checkout as described in the [README](../README.md#install-from-source). The CLI supports the same surface for every adapter:
 
 ```sh
 taskfence install claude --scope user
@@ -50,7 +50,9 @@ The adapter accepts bounded current-version `PreToolUse` and `PostToolUse` paylo
 - denial is exact structured `permissionDecision: "deny"`; and
 - malformed payload or internal failure exits 2 with a reason, which blocks on the checked host version.
 
-For `ExitPlanMode`, a root-session pre hook validates `tool_input.plan`, `planFilePath`, and the exact contract. It returns `ask`, not `allow`, so TaskFence does not bypass the native user approval prompt. A successful post hook reads `tool_response.plan` (not the mutable plan file), checkpoints and activates it, and binds the Claude root session. A child `ExitPlanMode` is denied.
+By default Claude Code stores native plans under `${CLAUDE_CONFIG_DIR:-~/.claude}/plans`. TaskFence 0.1.1 defers only that default host-managed `Write`, only while `permission_mode` is `plan`, to Claude Code's own gate and never treats it as project authority. The directory must resolve physically outside the project, be owned by the current user, and not be group/world-writable; an existing destination must be a current-user-owned, single-link regular file outside the project. Symlinked, hard-linked, project-contained, and ambiguous destinations fail closed. Claude Code's supported `plansDirectory` customization is intentionally unsupported: the pre-write hook does not expose the host's resolved setting, so accepting another model-supplied path would weaken the boundary. Customized plan paths fail closed; use the default directory for TaskFence setup. Content remains bounded, and ordinary writes still require an active contract.
+
+For `ExitPlanMode`, a root-session pre hook validates the host-injected `tool_input.plan`, optional `planFilePath`, and the exact contract, then durably correlates its hash with the session and tool-use ID. It returns `ask`, not `allow`, so TaskFence does not bypass the native user approval prompt. Official guidance prefers returned `tool_response.plan`, which TaskFence validates when present. In the tested Claude Code 2.1.220 interactive flow, the successful post payload instead had empty `tool_input`, `tool_response.plan: null`, and `tool_response.filePath`; that exact shape is runtime-observed, not documented as stable. The generated 2.1.220 output schema permits nullable plan text and an optional file path, so TaskFence uses the secure plan-file read only as that pinned fallback, verifies it against the pre-hook correlation, then checkpoints, activates, and binds the Claude root session. A child `ExitPlanMode` is denied.
 
 Claude reports `agent_id` in child tool hooks. TaskFence derives a deterministic child ID from the root host session and agent ID and records the root session as parent. This is adapter-specific; no universal inheritance is implied. The current explicit tool catalog does not allow Claude's `Agent` spawn tool, because unknown tools are denied.
 
@@ -71,7 +73,7 @@ The adapter contains a `PermissionRequest` handler, but the current installer re
 
 ### OpenCode
 
-The generated loader returns the ESM plugin adapter. At initialization TaskFence canonicalizes OpenCode's project `directory`; all tool calls are evaluated against that immutable root. A before-hook rejection throws, preventing the wrapped executor from running. After hooks correlate tool/session/call/raw args and finalize pending state.
+The generated loader returns the ESM plugin adapter. At initialization TaskFence canonicalizes OpenCode's project `directory`; all tool calls are evaluated against that immutable root. A before-hook rejection throws, preventing the wrapped executor from running. After hooks correlate tool/session/call/raw args and finalize pending state. The pinned current after hook repeats args, which TaskFence hashes directly; for the older compatible shape that omits args, TaskFence re-hashes the retained shared before-hook argument carrier.
 
 OpenCode `plan_exit` does not itself grant TaskFence authority. Before it can proceed:
 
@@ -81,9 +83,9 @@ OpenCode `plan_exit` does not itself grant TaskFence authority. Before it can pr
 4. the reported session directory must be canonical and equal to the plugin root; and
 5. a parent, when present, must already be in durable authority.
 
-After `plan_exit`, TaskFence checks that the exact plan/root/contract, generation, and revision did not change between hooks.
+After `plan_exit`, TaskFence revalidates the explicit current after args or retained legacy argument carrier, then checks that the exact plan/root/contract, generation, and revision did not change between hooks.
 
-OpenCode runs all plugin before hooks sequentially with a shared mutable `output.args`. An earlier plugin can alter args before TaskFence sees them; a later plugin can alter args after TaskFence approves them. TaskFence hashes its observed pre args and compares the after args, so a mismatch leaves the project pending/fail-closed, but that post detection cannot undo effects already caused. OpenCode session event callbacks are fire-and-forget, so TaskFence does not depend on event ordering; it fetches ancestry synchronously in the before hook.
+OpenCode runs all plugin before hooks sequentially with a shared mutable `output.args`. An earlier plugin can alter args before TaskFence sees them; a later plugin can alter args after TaskFence approves them. TaskFence hashes its observed pre args and, at post, hashes explicit current after args or re-hashes the retained shared carrier for the older no-args shape. A mismatch leaves the project pending/fail-closed, but that post detection cannot undo effects already caused. OpenCode session event callbacks are fire-and-forget, so TaskFence does not depend on event ordering; it fetches ancestry synchronously in the before hook.
 
 ### OMP
 
@@ -115,7 +117,8 @@ Pi lets extension handlers mutate `event.input` in place; later handlers see ear
 Across all adapters:
 
 - explicitly classified reads are allowed without a contract;
-- commands and mutations require active contract plus bound session/call authority;
+- commands and project mutations require active contract plus bound session/call authority;
+- Claude Code's bounded native plan-file write is the sole pre-engine exception; TaskFence defers it to the host's own Plan Mode gate only when it resolves safely outside the project, and it grants no project authority;
 - unknown and malformed tools deny;
 - an allowed command/mutation is durably marked pending before the host executes it;
 - raw host input is hashed at pre and correlated at post;

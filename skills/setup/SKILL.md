@@ -21,7 +21,7 @@ Enter Plan Mode before inspecting the project. While planning, use only read-onl
 
 Draft a concrete implementation plan that names the intended changes, affected paths, verification, and recovery. Keep authority least-privileged: authorize only operations and exact commands needed by that plan.
 
-Do not use `Write` or another mutation tool to save the plan file before approval. Pass the complete plan directly in the `ExitPlanMode` call; pre-approval project mutations are intentionally unavailable.
+Claude Code may write its native plan file while Plan Mode is active; TaskFence defers only that host-managed write outside the project to Claude Code's own gate. Do not use mutation tools on project files before approval. Pass the complete plan in the `ExitPlanMode` call.
 
 Append exactly one top-level fenced block. Its opening delimiter must be the literal line `` ```taskfence-contract `` and its closing delimiter must be the literal line `` ``` ``. Nothing may follow the closing fence. The body must be strict JSON with no comments, duplicate keys, or unknown fields, and must contain all seven fields:
 

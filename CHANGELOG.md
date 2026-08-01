@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.1.1 - 2026-08-01
+
+### Fixed
+
+- Claude Code 2.1.220 native Plan Mode now preserves the host's normal approval
+  screen and activates only after a matching successful post hook. Native plan
+  writes and approved plan files are bounded, path-confined, stable-read, and
+  correlated to the exact pre-approved contract.
+- Claude child agents cannot use the native plan-file exception or activate a
+  root contract.
+- OpenCode 1.18.10 hooks accept both legacy and current post-hook argument
+  shapes without weakening exact pre/post input correlation.
+- Stale-lock recovery no longer loses an acquired lock when quarantine paths
+  disappear or overlap with another recoverer.
+- Node 20 compatibility tests now execute the committed CLI in isolated child
+  processes without relying on a development-only loader.
+
+### Security
+
+- Receipt readers reject unstable, aliased, oversized, or non-regular inputs
+  and keep cursor verification bounded across process boundaries.
+- Patched development dependencies remove the published low-severity advisory
+  chain without changing TaskFence's runtime dependency surface.
+
 ## 0.1.0 - 2026-07-31
 
 First public release of TaskFence, a deterministic application-hook policy
@@ -20,8 +44,11 @@ enforcement layer for coding agents.
   `none`. Path selectors support exact paths and `/**` subtrees; command rules
   are exact argument vectors with a `cwd` relative to the project root.
 - **Read-only tolerance and fail-closed mutations.** With no contract active,
-  read-only tool calls are allowed and all mutations and commands are denied.
-  Mutations and commands require an active contract plus bound host authority.
+  read-only tool calls are allowed and project mutations/commands are denied.
+  Claude Code's bounded native plan-file write is the sole pre-engine exception:
+  TaskFence defers it to the host's own Plan Mode gate, and it grants no project
+  authority. Project mutations and commands require an active contract plus
+  bound host authority.
 - **Checkpoint-then-activate lifecycle.** A contract is staged, a content
   addressed checkpoint of the project tree is committed, and only after the
   checkpoint succeeds does the contract become active.

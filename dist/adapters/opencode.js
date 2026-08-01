@@ -140,7 +140,6 @@ var JsonDuplicateKeyScanner = class {
   constructor(source) {
     this.source = source;
   }
-  source;
   offset = 0;
   scan() {
     this.skipWhitespace();
@@ -20092,6 +20091,7 @@ var TaskFencePlugin = async ({ directory, client }) => {
           );
         }
         pendingPlans.set(key, {
+          argumentCarrier: output,
           contractHash: state.contract.contractHash,
           generation: state.generation,
           planHash: compiled.planHash,
@@ -20116,6 +20116,7 @@ var TaskFencePlugin = async ({ directory, client }) => {
       }
       if (result.inputHash !== null) {
         pendingCalls.set(JSON.stringify([input.sessionID, input.callID]), {
+          argumentCarrier: output,
           inputHash: result.inputHash,
           root: result.root,
           toolName: input.tool
@@ -20130,7 +20131,14 @@ var TaskFencePlugin = async ({ directory, client }) => {
           throw new Error("TaskFence plan_exit completion has no matching preflight");
         }
         pendingPlans.delete(key);
-        const observed = compileContract(requirePlan(input.args), projectRoot);
+        const observedArgs2 = "args" in input ? input.args : expected.argumentCarrier.args;
+        if (typeof observedArgs2 !== "object" || observedArgs2 === null || Array.isArray(observedArgs2)) {
+          throw new Error("TaskFence plan_exit completion has invalid arguments");
+        }
+        const observed = compileContract(
+          requirePlan(observedArgs2),
+          projectRoot
+        );
         if (observed.planHash !== expected.planHash || observed.root !== expected.root) {
           throw new Error("TaskFence plan_exit correlation mismatch");
         }
@@ -20145,10 +20153,11 @@ var TaskFencePlugin = async ({ directory, client }) => {
       const pending = pendingCalls.get(key);
       if (pending === void 0) return;
       pendingCalls.delete(key);
+      const observedArgs = "args" in input ? input.args : pending.argumentCarrier.args;
       const inputHash = hashRawToolCall({
         runtime: "opencode",
         toolName: input.tool,
-        input: input.args,
+        input: observedArgs,
         cwd: projectRoot,
         sessionId: input.sessionID,
         callId: input.callID

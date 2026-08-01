@@ -116,8 +116,8 @@ Activation is therefore not reported until the checkpoint manifest and its recei
 1. The adapter validates the host payload and supplies runtime, raw host input, canonical/observed cwd, session ID, optional parent ID, and call ID.
 2. The engine discovers the nearest durable TaskFence state boundary from the observed cwd and normalizes the tool call.
 3. Authority is checked. If authority is unbound, only a valid root session can bind it. A new child can be delegated only when its host-verified parent already belongs to the same runtime authority tree.
-4. Explicitly classified read-only calls are allowed even with no active contract. Unknown and malformed calls are denied.
-5. Commands and mutations require `active` state, the frozen contract, authorized session/call IDs, exact policy authorization, and no pending mutation/recovery condition.
+4. Explicitly classified read-only calls are allowed even with no active contract. At the adapter boundary, Claude Code may defer only its bounded native plan-file write while the host reports Plan Mode and the destination resolves safely outside the project; this does not enter the engine or grant project authority. Unknown and malformed calls are denied.
+5. Commands and project mutations require `active` state, the frozen contract, authorized session/call IDs, exact policy authorization, and no pending mutation/recovery condition.
 6. Before returning allow, TaskFence hashes the **raw host input** and durably transitions to `mutation_pending`. The pending record and decision receipt commit through the WAL.
 
 Commands share the pending-mutation slot because an approved command may mutate indirectly. Only one command or mutation can be in flight for a project. Concurrent attempts are denied until post-tool reconciliation completes.
@@ -171,7 +171,7 @@ Root `.git` is never included in the checkpoint and is explicitly skipped when r
 
 ## Core invariants
 
-1. Read-only calls may run without a contract; commands and mutations may not.
+1. Read-only calls may run without a contract; commands and project mutations may not. The sole pre-engine exception is Claude Code's bounded native plan-file write in host-reported Plan Mode when the destination resolves safely outside the project; it remains under the host's own gate and grants no project authority.
 2. A contract is bound to the exact canonical root, complete plan hash, compiled contract hash, and revision.
 3. The checkpoint must exist before `active` state.
 4. Protected selectors override every write/create/delete selector.

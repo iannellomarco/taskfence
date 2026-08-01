@@ -13,7 +13,6 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -31,12 +30,15 @@ import {
 
 const ORIGINAL_TASKFENCE_STATE_DIR = process.env.TASKFENCE_STATE_DIR;
 const ORIGINAL_XDG_STATE_HOME = process.env.XDG_STATE_HOME;
-const VITE_NODE = fileURLToPath(new URL("../node_modules/.bin/vite-node", import.meta.url));
-const PUBLIC_API = fileURLToPath(new URL("../src/index.ts", import.meta.url));
+const PUBLIC_API_URL = new URL("../dist/index.js", import.meta.url).href;
+const VERIFY_RECEIPTS_SCRIPT = [
+  `import { verifyReceiptLedger } from ${JSON.stringify(PUBLIC_API_URL)};`,
+  "const result = await verifyReceiptLedger(process.argv[1]);",
+  "process.stdout.write(JSON.stringify(result));",
+].join("\n");
 const execFileAsync = promisify(execFile);
 
 let sandbox: string;
-let probeFile: string;
 
 function plan(): string {
   return [
@@ -65,8 +67,8 @@ async function createWorktree(name: string): Promise<string> {
 
 async function verifyInDisposableProcess(root: string): Promise<ReceiptVerificationResult> {
   const { stdout } = await execFileAsync(
-    VITE_NODE,
-    [probeFile, root],
+    process.execPath,
+    ["--input-type=module", "--eval", VERIFY_RECEIPTS_SCRIPT, root],
     {
       encoding: "utf8",
       env: { ...process.env },
@@ -92,15 +94,6 @@ beforeEach(async () => {
   sandbox = await mkdtemp(path.join(tmpdir(), "taskfence-receipt-hardening-test-"));
   process.env.TASKFENCE_STATE_DIR = path.join(sandbox, "durable-state");
   delete process.env.XDG_STATE_HOME;
-  probeFile = path.join(sandbox, "verify-receipts.ts");
-  await writeFile(
-    probeFile,
-    [
-      `import { verifyReceiptLedger } from ${JSON.stringify(PUBLIC_API)};`,
-      "const result = await verifyReceiptLedger(process.argv[2]);",
-      "process.stdout.write(JSON.stringify(result));",
-    ].join("\n"),
-  );
 });
 
 afterEach(async () => {

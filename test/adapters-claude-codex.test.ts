@@ -1,4 +1,12 @@
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,9 +19,11 @@ import { approvePlan, getStatus } from "../src/engine.js";
 
 const originalTaskFenceStateDirectory = process.env.TASKFENCE_STATE_DIR;
 const originalXdgStateHome = process.env.XDG_STATE_HOME;
+const originalClaudeConfigDirectory = process.env.CLAUDE_CONFIG_DIR;
 
 let temporaryDirectory: string;
 let projectRoot: string;
+let claudePlansDirectory: string;
 
 function contractPlan(): string {
   return `# Test plan
@@ -102,6 +112,9 @@ beforeEach(async () => {
   projectRoot = join(temporaryDirectory, "project");
   await mkdir(projectRoot);
   projectRoot = await realpath(projectRoot);
+  process.env.CLAUDE_CONFIG_DIR = join(temporaryDirectory, "claude-config");
+  claudePlansDirectory = join(process.env.CLAUDE_CONFIG_DIR, "plans");
+  await mkdir(claudePlansDirectory, { recursive: true });
   await writeFile(join(projectRoot, "tracked.txt"), "before\n");
   process.env.TASKFENCE_STATE_DIR = join(temporaryDirectory, "state");
   process.env.XDG_STATE_HOME = join(temporaryDirectory, "xdg-state");
@@ -117,6 +130,11 @@ afterEach(async () => {
     delete process.env.XDG_STATE_HOME;
   } else {
     process.env.XDG_STATE_HOME = originalXdgStateHome;
+  }
+  if (originalClaudeConfigDirectory === undefined) {
+    delete process.env.CLAUDE_CONFIG_DIR;
+  } else {
+    process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDirectory;
   }
   await rm(temporaryDirectory, { recursive: true, force: true });
 });
@@ -200,8 +218,34 @@ describe("Claude Code adapter", () => {
     expect(enter).toEqual({ exitCode: 0, stdout: "", stderr: "" });
   });
 
-  it("asks for ExitPlanMode approval and activates only after its successful post hook", async () => {
+  it("supports Claude's native plan file and activates from its current post payload", async () => {
     const plan = contractPlan();
+    const planPath = join(claudePlansDirectory, "quiet-test-plan.md");
+    const planFileInput = { file_path: planPath, content: plan };
+    const planFilePrePayload = claudePayload(
+      "PreToolUse",
+      "Write",
+      planFileInput,
+      "claude-plan-file-write",
+    );
+    planFilePrePayload.permission_mode = "plan";
+
+    const planFilePre = await runClaudeHook(planFilePrePayload);
+    expect(planFilePre).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+    await writeFile(planPath, plan);
+    const planFilePostPayload = {
+      ...claudePayload(
+        "PostToolUse",
+        "Write",
+        planFileInput,
+        "claude-plan-file-write",
+      ),
+      permission_mode: "plan",
+      tool_response: { filePath: planPath },
+    };
+    const planFilePost = await runClaudeHook(planFilePostPayload);
+    expect(planFilePost).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+
     const pre = await runClaudeHook(
       claudePayload("PreToolUse", "ExitPlanMode", {
         plan,
@@ -222,19 +266,304 @@ describe("Claude Code adapter", () => {
     });
     expect((await getStatus(projectRoot)).status).toBe("absent");
 
-    const post = await runClaudeHook({
-      ...claudePayload("PostToolUse", "ExitPlanMode", {
-        plan,
-        planFilePath: join(projectRoot, "plan.md"),
-        allowedPrompts: [],
-      }),
+    const postPayload = {
+      ...claudePayload("PostToolUse", "ExitPlanMode", {}),
       tool_response: {
-        plan,
+        plan: null,
+        isAgent: false,
+        filePath: planPath,
+      },
+    };
+    const post = await runClaudeHook(postPayload);
+    expect(post).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+    expect((await getStatus(projectRoot)).status).toBe("active");
+    expect(await runClaudeHook(postPayload)).toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+  });
+
+  it("fails closed when the written native plan differs from its tool input", async () => {
+    const plan = contractPlan();
+    const planPath = join(claudePlansDirectory, "changed-during-write.md");
+    const planFileInput = { file_path: planPath, content: plan };
+    const prePayload = claudePayload(
+      "PreToolUse",
+      "Write",
+      planFileInput,
+      "claude-changed-plan-write",
+    );
+    prePayload.permission_mode = "plan";
+    expect(await runClaudeHook(prePayload)).toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+
+    await writeFile(planPath, plan.replace("tracked.txt", "outside.txt"));
+    const post = await runClaudeHook({
+      ...claudePayload(
+        "PostToolUse",
+        "Write",
+        planFileInput,
+        "claude-changed-plan-write",
+      ),
+      permission_mode: "plan",
+      tool_response: { filePath: planPath },
+    });
+    expect(post.exitCode).toBe(2);
+    expect(post.stderr).toMatch(
+      /Written Claude plan file does not match its pre-tool input/u,
+    );
+  });
+
+  it("rejects a native plan file that differs from the pre-approved input", async () => {
+    const approvedPlan = contractPlan();
+    const substitutedPlan = approvedPlan.replace("tracked.txt", "outside.txt");
+    const planPath = join(claudePlansDirectory, "substituted-plan.md");
+    await writeFile(planPath, substitutedPlan);
+
+    const pre = await runClaudeHook(
+      claudePayload(
+        "PreToolUse",
+        "ExitPlanMode",
+        { plan: approvedPlan, allowedPrompts: [] },
+        "claude-substituted-plan",
+      ),
+    );
+    expect(parsedStdout(pre)).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "ask",
+      },
+    });
+
+    const postPayload = {
+      ...claudePayload(
+        "PostToolUse",
+        "ExitPlanMode",
+        {},
+        "claude-substituted-plan",
+      ),
+      tool_response: {
+        plan: null,
+        isAgent: false,
+        filePath: planPath,
+      },
+    };
+    const post = await runClaudeHook(postPayload);
+    expect(post.exitCode).toBe(2);
+    expect(post.stderr).toMatch(
+      /does not match the pre-approved ExitPlanMode input/u,
+    );
+    expect((await getStatus(projectRoot)).status).toBe("absent");
+
+    await writeFile(planPath, approvedPlan);
+    expect(await runClaudeHook(postPayload)).toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+    expect((await getStatus(projectRoot)).status).toBe("active");
+  });
+
+  it("rejects a current ExitPlanMode post without a matching pre hook", async () => {
+    const planPath = join(claudePlansDirectory, "missing-pre-hook.md");
+    await writeFile(planPath, contractPlan());
+    const post = await runClaudeHook({
+      ...claudePayload(
+        "PostToolUse",
+        "ExitPlanMode",
+        {},
+        "claude-missing-pre-hook",
+      ),
+      tool_response: {
+        plan: null,
+        isAgent: false,
+        filePath: planPath,
+      },
+    });
+    expect(post.exitCode).toBe(2);
+    expect(post.stderr).toMatch(/Claude approval correlation/u);
+    expect((await getStatus(projectRoot)).status).toBe("absent");
+  });
+
+  it("does not exempt ordinary writes from pre-approval enforcement", async () => {
+    const planPath = join(claudePlansDirectory, "not-in-plan-mode.md");
+    const ordinary = await runClaudeHook(
+      claudePayload("PreToolUse", "Write", {
+        file_path: planPath,
+        content: contractPlan(),
+      }),
+    );
+    expect(parsedStdout(ordinary)).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+      },
+    });
+
+    const outsidePayload = claudePayload(
+      "PreToolUse",
+      "Write",
+      {
+        file_path: join(temporaryDirectory, "outside-plans.md"),
+        content: contractPlan(),
+      },
+      "claude-non-plan-file-write",
+    );
+    outsidePayload.permission_mode = "plan";
+    const outside = await runClaudeHook(outsidePayload);
+    expect(parsedStdout(outside)).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+      },
+    });
+
+    const existingPlanPath = join(claudePlansDirectory, "existing-plan.md");
+    await writeFile(existingPlanPath, "existing plan\n");
+    const existingPayload = claudePayload(
+      "PreToolUse",
+      "Write",
+      {
+        file_path: existingPlanPath,
+        content: contractPlan(),
+      },
+      "claude-existing-plan-write",
+    );
+    existingPayload.permission_mode = "plan";
+    const existing = await runClaudeHook(existingPayload);
+    expect(parsedStdout(existing)).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+        permissionDecisionReason: expect.stringMatching(/fresh file/u),
+      },
+    });
+
+    const reservedPlanPath = join(claudePlansDirectory, "reserved-plan.md");
+    const firstReservation = claudePayload(
+      "PreToolUse",
+      "Write",
+      {
+        file_path: reservedPlanPath,
+        content: contractPlan(),
+      },
+      "claude-first-plan-reservation",
+    );
+    firstReservation.permission_mode = "plan";
+    expect(await runClaudeHook(firstReservation)).toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+    const conflictingReservation = claudePayload(
+      "PreToolUse",
+      "Write",
+      {
+        file_path: reservedPlanPath,
+        content: contractPlan(),
+      },
+      "claude-conflicting-plan-reservation",
+    );
+    conflictingReservation.permission_mode = "plan";
+    const conflict = await runClaudeHook(conflictingReservation);
+    expect(parsedStdout(conflict)).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+      },
+    });
+
+    const childPayload = claudePayload(
+      "PreToolUse",
+      "Write",
+      {
+        file_path: join(claudePlansDirectory, "child-plan.md"),
+        content: contractPlan(),
+      },
+      "claude-child-plan-write",
+    );
+    childPayload.permission_mode = "plan";
+    childPayload.agent_id = "child-agent";
+    const child = await runClaudeHook(childPayload);
+    expect(parsedStdout(child)).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+      },
+    });
+  });
+
+  it("does not exempt a Claude plan directory inside the project", async () => {
+    process.env.CLAUDE_CONFIG_DIR = join(projectRoot, ".claude");
+    const projectPlansDirectory = join(
+      process.env.CLAUDE_CONFIG_DIR,
+      "plans",
+    );
+    await mkdir(projectPlansDirectory, { recursive: true });
+    const payload = claudePayload(
+      "PreToolUse",
+      "Write",
+      {
+        file_path: join(projectPlansDirectory, "project-plan.md"),
+        content: contractPlan(),
+      },
+      "claude-project-plan-write",
+    );
+    payload.permission_mode = "plan";
+
+    const result = await runClaudeHook(payload);
+    expect(parsedStdout(result)).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+      },
+    });
+    expect((await getStatus(projectRoot)).status).toBe("absent");
+  });
+
+  it("does not exempt symlinked or hard-linked native plan destinations", async () => {
+    const trackedPath = join(projectRoot, "tracked.txt");
+    const symlinkPath = join(claudePlansDirectory, "symlinked-plan.md");
+    const hardlinkPath = join(claudePlansDirectory, "hard-linked-plan.md");
+    await symlink(trackedPath, symlinkPath);
+    await link(trackedPath, hardlinkPath);
+
+    for (const [label, planPath] of [
+      ["symlink", symlinkPath],
+      ["hard link", hardlinkPath],
+    ] as const) {
+      const payload = claudePayload(
+        "PreToolUse",
+        "Write",
+        { file_path: planPath, content: contractPlan() },
+        `claude-${label}-plan-write`,
+      );
+      payload.permission_mode = "plan";
+      const result = await runClaudeHook(payload);
+      expect(parsedStdout(result), label).toMatchObject({
+        hookSpecificOutput: {
+          permissionDecision: "deny",
+        },
+      });
+    }
+  });
+
+  it("fails closed when an ExitPlanMode response changes the approved input", async () => {
+    const plan = contractPlan();
+    const changed = plan.replace("tracked.txt", "outside.txt");
+    const result = await runClaudeHook({
+      ...claudePayload(
+        "PostToolUse",
+        "ExitPlanMode",
+        { plan },
+        "claude-plan-mismatch",
+      ),
+      tool_response: {
+        plan: changed,
         filePath: join(projectRoot, "plan.md"),
       },
     });
-    expect(post).toEqual({ exitCode: 0, stdout: "", stderr: "" });
-    expect((await getStatus(projectRoot)).status).toBe("active");
+
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toMatch(/does not match the approved ExitPlanMode input/u);
+    expect((await getStatus(projectRoot)).status).toBe("absent");
   });
 
   it("returns the exact Claude deny object and remains silent for allowed calls", async () => {

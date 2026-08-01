@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'crypto';
 import { constants, realpathSync, statSync, lstatSync, readdirSync } from 'fs';
-import path, { resolve, dirname, isAbsolute, relative, sep, join, basename } from 'path';
-import { realpath, lstat, open, rename, unlink, utimes, mkdir, chmod, link, readdir, readlink } from 'fs/promises';
+import { realpath, lstat, unlink, open, chmod, rename, utimes, mkdir, link, readdir, readlink } from 'fs/promises';
 import { homedir } from 'os';
+import path, { dirname, join, isAbsolute, resolve, basename, relative, sep } from 'path';
 import 'readline/promises';
 import { setTimeout } from 'timers/promises';
 
@@ -140,7 +140,6 @@ var JsonDuplicateKeyScanner = class {
   constructor(source) {
     this.source = source;
   }
-  source;
   offset = 0;
   scan() {
     this.skipWhitespace();
@@ -16200,7 +16199,30 @@ function compileContract(planText, root) {
   return freezeCompiledContract(compiled);
 }
 var MAX_PLAN_BYTES = 8 * 1024 * 1024;
-constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+var READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+function validatePlanFileMetadata(metadata, path7) {
+  if (!metadata.isFile()) {
+    throw new Error(`TaskFence plan file is not a regular file: ${path7}`);
+  }
+  if (metadata.size < 0n || metadata.size > BigInt(MAX_PLAN_BYTES)) {
+    throw new Error(`TaskFence plan file exceeds ${MAX_PLAN_BYTES} bytes`);
+  }
+  if (typeof process.getuid === "function" && metadata.uid !== BigInt(process.getuid())) {
+    throw new Error(`TaskFence plan file is not owned by the current user: ${path7}`);
+  }
+}
+function metadataChanged(before, after) {
+  return before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs;
+}
+function decodePlan(bytes) {
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error("TaskFence plan file is not valid UTF-8 text");
+  }
+  return requireBoundedPlanText(text);
+}
 function requireBoundedPlanText(value, label = "TaskFence plan") {
   if (typeof value !== "string") {
     throw new TypeError(`${label} must be text`);
@@ -16213,6 +16235,34 @@ function requireBoundedPlanText(value, label = "TaskFence plan") {
     throw new Error(`${label} must be non-empty, NUL-free text`);
   }
   return value;
+}
+async function readFromHandle(handle, path7) {
+  const before = await handle.stat({ bigint: true });
+  validatePlanFileMetadata(before, path7);
+  const expectedBytes = Number(before.size);
+  const bytes = Buffer.allocUnsafe(expectedBytes + 1);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, null);
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  if (offset > MAX_PLAN_BYTES) {
+    throw new Error(`TaskFence plan file exceeds ${MAX_PLAN_BYTES} bytes`);
+  }
+  const after = await handle.stat({ bigint: true });
+  if (metadataChanged(before, after) || offset !== expectedBytes) {
+    throw new Error("TaskFence plan file changed while it was being read");
+  }
+  return decodePlan(bytes.subarray(0, offset));
+}
+async function readBoundedPlanFile(path7) {
+  const handle = await open(path7, READ_FLAGS);
+  try {
+    return await readFromHandle(handle, path7);
+  } finally {
+    await handle.close();
+  }
 }
 var DIRECTORY_MODE = 448;
 async function canonicalStateRoot(root) {
@@ -18030,9 +18080,9 @@ async function listQuarantineFiles(projectDir) {
   return quarantineFiles;
 }
 function extractRecovererPid(quarantinePath) {
-  const basename2 = quarantinePath.split("/").pop();
-  if (basename2 === void 0) return null;
-  const match = basename2.match(/^\.stale-lock-([1-9]\d*)-/);
+  const basename3 = quarantinePath.split("/").pop();
+  if (basename3 === void 0) return null;
+  const match = basename3.match(/^\.stale-lock-([1-9]\d*)-/);
   return match ? Number.parseInt(match[1], 10) : null;
 }
 async function scanQuarantine(projectDir, rootHash, staleLockMs) {
@@ -20597,6 +20647,15 @@ var MAX_JSON_TOTAL_STRING_LENGTH = 16 * 1024 * 1024;
 var MAX_IDENTIFIER_LENGTH = 4096;
 var MAX_PATH_LENGTH = 65536;
 var MAX_SHORT_FIELD_LENGTH = 1024;
+var CLAUDE_APPROVAL_FILE_MODE = 384;
+var MAX_CLAUDE_APPROVAL_BYTES = 16 * 1024;
+var CLAUDE_APPROVAL_KEYS = [
+  "callId",
+  "planHash",
+  "root",
+  "sessionId",
+  "version"
+];
 var ClaudeHookInputError = class extends Error {
   constructor(message) {
     super(message);
@@ -20692,7 +20751,11 @@ function parsePayload(payload) {
   requireString(object2, "prompt_id", MAX_IDENTIFIER_LENGTH);
   requireString(object2, "transcript_path", MAX_PATH_LENGTH);
   const cwd = requireString(object2, "cwd", MAX_PATH_LENGTH);
-  requireString(object2, "permission_mode", MAX_SHORT_FIELD_LENGTH);
+  const permissionMode2 = requireString(
+    object2,
+    "permission_mode",
+    MAX_SHORT_FIELD_LENGTH
+  );
   requireEffort(object2);
   const agentId = optionalString(object2, "agent_id", MAX_IDENTIFIER_LENGTH);
   const agentType = optionalString(object2, "agent_type", MAX_SHORT_FIELD_LENGTH);
@@ -20709,6 +20772,7 @@ function parsePayload(payload) {
       ...agentId === void 0 ? {} : { agentId },
       ...agentType === void 0 ? {} : { agentType },
       cwd,
+      permissionMode: permissionMode2,
       event,
       toolName,
       toolInput,
@@ -20721,6 +20785,7 @@ function parsePayload(payload) {
     ...agentId === void 0 ? {} : { agentId },
     ...agentType === void 0 ? {} : { agentType },
     cwd,
+    permissionMode: permissionMode2,
     event,
     toolName,
     toolInput,
@@ -20784,7 +20849,257 @@ function requirePlan(object2, field) {
     );
   }
 }
+function claudePlansDirectory() {
+  const configured = process.env.CLAUDE_CONFIG_DIR;
+  const configDirectory = configured === void 0 || configured.length === 0 || configured.includes("\0") ? join(homedir(), ".claude") : configured;
+  return resolve(configDirectory, "plans");
+}
+function claudePlanPath(value) {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    return void 0;
+  }
+  if (!isAbsolute(value)) return void 0;
+  const resolved = resolve(value);
+  const name = basename(resolved);
+  if (dirname(resolved) !== claudePlansDirectory() || name.length <= ".md".length || !name.endsWith(".md")) {
+    return void 0;
+  }
+  return resolved;
+}
+async function claudePlanWritePath(payload, requireFresh) {
+  if (payload.agentId !== void 0 || payload.permissionMode !== "plan" || payload.toolName !== "Write") {
+    return void 0;
+  }
+  const planPath = claudePlanPath(payload.toolInput.file_path);
+  if (planPath === void 0) return void 0;
+  const canonicalRoot = await canonicalStateRoot(payload.cwd);
+  if (isContainedPath(canonicalRoot, planPath)) return void 0;
+  let canonicalPlansDirectory;
+  try {
+    canonicalPlansDirectory = await realpath(dirname(planPath));
+    const directoryMetadata = await lstat(canonicalPlansDirectory);
+    if (!directoryMetadata.isDirectory() || typeof process.getuid === "function" && directoryMetadata.uid !== process.getuid() || (directoryMetadata.mode & 18) !== 0) {
+      return void 0;
+    }
+  } catch {
+    return void 0;
+  }
+  if (isContainedPath(canonicalRoot, canonicalPlansDirectory)) return void 0;
+  if (requireFresh) {
+    try {
+      await lstat(planPath);
+      return void 0;
+    } catch (error51) {
+      if (!isNodeError3(error51, "ENOENT")) return void 0;
+    }
+  }
+  return planPath;
+}
+async function claudeApprovalLocation(payload) {
+  const layout = await stateLayout(payload.cwd);
+  const key = createHash("sha256").update(payload.sessionId, "utf8").update("\0", "utf8").update(payload.toolUseId, "utf8").digest("hex");
+  return {
+    path: join(layout.projectDir, `.claude-approval-${key}.json`),
+    projectDirectory: layout.projectDir,
+    root: layout.canonicalRoot
+  };
+}
+async function claudePlanWriteLocation(payload, planPath) {
+  const layout = await stateLayout(payload.cwd);
+  const key = createHash("sha256").update("plan-write", "utf8").update("\0", "utf8").update(planPath, "utf8").digest("hex");
+  return {
+    path: join(layout.projectDir, `.claude-plan-write-${key}.json`),
+    projectDirectory: layout.projectDir,
+    root: layout.canonicalRoot
+  };
+}
+async function readClaudeApprovalRecord(path7) {
+  const requirements = {
+    mode: CLAUDE_APPROVAL_FILE_MODE,
+    maxBytes: MAX_CLAUDE_APPROVAL_BYTES,
+    label: "Claude approval correlation"
+  };
+  const { handle, metadata: before } = await openSecureFile(
+    path7,
+    constants.O_RDONLY,
+    requirements
+  );
+  try {
+    const expectedBytes = before.size;
+    const bytes = Buffer.allocUnsafe(expectedBytes + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(
+        bytes,
+        offset,
+        bytes.length - offset,
+        null
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    const after = await handle.stat();
+    validateSecureFile(path7, after, requirements);
+    if (offset !== expectedBytes || before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+      throw new ClaudeHookInputError(
+        "Claude approval correlation changed while it was being read"
+      );
+    }
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(
+        bytes.subarray(0, offset)
+      );
+    } catch {
+      throw new ClaudeHookInputError(
+        "Claude approval correlation is not valid UTF-8 text"
+      );
+    }
+    let value;
+    try {
+      value = JSON.parse(text);
+    } catch {
+      throw new ClaudeHookInputError(
+        "Claude approval correlation is not valid JSON"
+      );
+    }
+    validateBoundedJson(value);
+    const object2 = requireRecord(value, "Claude approval correlation");
+    const keys = Object.keys(object2).sort();
+    if (keys.length !== CLAUDE_APPROVAL_KEYS.length || keys.some((key, index) => key !== CLAUDE_APPROVAL_KEYS[index])) {
+      throw new ClaudeHookInputError(
+        "Claude approval correlation has an invalid schema"
+      );
+    }
+    if (object2.version !== 1) {
+      throw new ClaudeHookInputError(
+        "Claude approval correlation has an invalid version"
+      );
+    }
+    const planHash = requireString(object2, "planHash", 64);
+    if (!/^[0-9a-f]{64}$/u.test(planHash)) {
+      throw new ClaudeHookInputError(
+        "Claude approval correlation has an invalid plan hash"
+      );
+    }
+    return {
+      version: 1,
+      root: requireString(object2, "root", MAX_PATH_LENGTH),
+      sessionId: requireString(object2, "sessionId", MAX_IDENTIFIER_LENGTH),
+      callId: requireString(object2, "callId", MAX_IDENTIFIER_LENGTH),
+      planHash
+    };
+  } finally {
+    await handle.close();
+  }
+}
+async function stageClaudeApproval(location, payload, planHash) {
+  const record2 = {
+    version: 1,
+    root: location.root,
+    sessionId: payload.sessionId,
+    callId: payload.toolUseId,
+    planHash
+  };
+  const text = `${JSON.stringify(record2)}
+`;
+  const requirements = {
+    mode: CLAUDE_APPROVAL_FILE_MODE,
+    maxBytes: MAX_CLAUDE_APPROVAL_BYTES,
+    label: "Claude approval correlation"
+  };
+  let created;
+  try {
+    created = await createSecureFile(
+      location.path,
+      constants.O_WRONLY,
+      requirements
+    );
+  } catch (error51) {
+    if (!isNodeError3(error51, "EEXIST")) throw error51;
+    const existing = await readClaudeApprovalRecord(location.path);
+    if (JSON.stringify(existing) !== JSON.stringify(record2)) {
+      throw new ClaudeHookInputError(
+        "Claude approval correlation already exists with different content"
+      );
+    }
+    await syncSecureDirectory(location.projectDirectory);
+    return;
+  }
+  const handle = created.handle;
+  let closed = false;
+  try {
+    await handle.writeFile(text, "utf8");
+    await handle.sync();
+    const after = await handle.stat();
+    validateSecureFile(location.path, after, requirements);
+    if (after.size !== Buffer.byteLength(text, "utf8")) {
+      throw new ClaudeHookInputError(
+        "Claude approval correlation write was incomplete"
+      );
+    }
+  } catch (error51) {
+    await handle.close().catch(() => void 0);
+    closed = true;
+    await unlink(location.path).catch(() => void 0);
+    throw error51;
+  } finally {
+    if (!closed) await handle.close().catch(() => void 0);
+  }
+  await syncSecureDirectory(location.projectDirectory);
+}
+async function verifyClaudeApproval(location, payload, planHash, mismatchMessage) {
+  let record2;
+  try {
+    record2 = await readClaudeApprovalRecord(location.path);
+  } catch (error51) {
+    throw new ClaudeHookInputError(
+      `Could not load Claude approval correlation: ${errorMessage2(error51)}`
+    );
+  }
+  const matches = record2.root === location.root && record2.sessionId === payload.sessionId && record2.callId === payload.toolUseId && record2.planHash === planHash;
+  if (!matches) {
+    throw new ClaudeHookInputError(mismatchMessage);
+  }
+}
+async function removeClaudeCorrelation(location) {
+  try {
+    await unlink(location.path);
+  } catch (error51) {
+    if (!isNodeError3(error51, "ENOENT")) throw error51;
+    return;
+  }
+  await syncSecureDirectory(location.projectDirectory);
+}
+async function claudeApprovalIsAlreadyActive(payload, planHash) {
+  const state = await getStatus(payload.cwd);
+  return (state.status === "active" || state.status === "mutation_pending") && state.contract?.planHash === planHash && state.authority?.runtime === "claude" && state.authority.rootSessionId === payload.sessionId;
+}
 async function runPreToolUse(payload) {
+  const planWritePath = await claudePlanWritePath(payload, true);
+  if (planWritePath !== void 0) {
+    try {
+      const content = requirePlan(payload.toolInput, "content");
+      const location = await claudePlanWriteLocation(payload, planWritePath);
+      await stageClaudeApproval(
+        location,
+        payload,
+        createHash("sha256").update(content, "utf8").digest("hex")
+      );
+    } catch (error51) {
+      return structuredDecision(
+        "deny",
+        `Could not reserve Claude's native plan file: ${errorMessage2(error51)}`
+      );
+    }
+    return silentSuccess();
+  }
+  if (payload.agentId === void 0 && payload.permissionMode === "plan" && payload.toolName === "Write") {
+    return structuredDecision(
+      "deny",
+      "Claude's native plan must use a fresh file in the default plans directory; custom plansDirectory paths and existing files are unsupported"
+    );
+  }
   if (payload.toolName === "ExitPlanMode") {
     if (payload.agentId !== void 0) {
       return structuredDecision(
@@ -20793,17 +21108,27 @@ async function runPreToolUse(payload) {
       );
     }
     let plan;
+    let planHash;
     try {
       plan = requirePlan(payload.toolInput, "plan");
       optionalString(payload.toolInput, "planFilePath", MAX_PATH_LENGTH);
       if (payload.toolInput.allowedPrompts !== void 0 && !Array.isArray(payload.toolInput.allowedPrompts)) {
         throw new ClaudeHookInputError("allowedPrompts must be an array when present");
       }
-      compileContract(plan, payload.cwd);
+      planHash = compileContract(plan, payload.cwd).planHash;
     } catch (error51) {
       return structuredDecision(
         "deny",
         `Invalid TaskFence contract: ${errorMessage2(error51)}`
+      );
+    }
+    try {
+      const location = await claudeApprovalLocation(payload);
+      await stageClaudeApproval(location, payload, planHash);
+    } catch (error51) {
+      return structuredDecision(
+        "deny",
+        `Could not secure Claude plan approval: ${errorMessage2(error51)}`
       );
     }
     return structuredDecision(
@@ -20819,18 +21144,96 @@ async function runPostToolUse(payload) {
   if (payload.toolResponse === void 0) {
     throw new ClaudeHookInputError("PostToolUse requires tool_response");
   }
+  const planWritePath = await claudePlanWritePath(payload, false);
+  if (planWritePath !== void 0) {
+    const expectedPlan = requirePlan(payload.toolInput, "content");
+    const reservation = await claudePlanWriteLocation(payload, planWritePath);
+    await verifyClaudeApproval(
+      reservation,
+      payload,
+      createHash("sha256").update(expectedPlan, "utf8").digest("hex"),
+      "Claude plan Write does not match its reserved pre-tool input"
+    );
+    const responsePath = claudePlanPath(
+      requireString(payload.toolResponse, "filePath", MAX_PATH_LENGTH)
+    );
+    if (responsePath !== planWritePath) {
+      throw new ClaudeHookInputError(
+        "Claude plan Write response path does not match its pre-tool input"
+      );
+    }
+    let observedPlan;
+    try {
+      observedPlan = await readBoundedPlanFile(planWritePath);
+    } catch (error51) {
+      throw new ClaudeHookInputError(
+        `Could not verify the written Claude plan file: ${errorMessage2(error51)}`
+      );
+    }
+    if (observedPlan !== expectedPlan) {
+      throw new ClaudeHookInputError(
+        "Written Claude plan file does not match its pre-tool input"
+      );
+    }
+    await removeClaudeCorrelation(reservation);
+    return silentSuccess();
+  }
   if (payload.toolName === "ExitPlanMode") {
     if (payload.agentId !== void 0) {
       throw new ClaudeHookInputError(
         "A Claude child agent cannot activate a root TaskFence contract"
       );
     }
-    const approvedPlan = requirePlan(payload.toolResponse, "plan");
-    requireString(payload.toolResponse, "filePath", MAX_PATH_LENGTH);
+    const responsePath = optionalString(
+      payload.toolResponse,
+      "filePath",
+      MAX_PATH_LENGTH
+    );
+    const inputPlan = payload.toolInput.plan === void 0 ? void 0 : requirePlan(payload.toolInput, "plan");
+    let approvedPlan;
+    if (payload.toolResponse.plan !== void 0 && payload.toolResponse.plan !== null) {
+      approvedPlan = requirePlan(payload.toolResponse, "plan");
+    } else {
+      const planPath = claudePlanPath(responsePath);
+      if (planPath === void 0) {
+        if (inputPlan === void 0) {
+          throw new ClaudeHookInputError(
+            "PostToolUse omitted the approved plan and returned an invalid Claude plan file path"
+          );
+        }
+        approvedPlan = inputPlan;
+      } else {
+        try {
+          approvedPlan = await readBoundedPlanFile(planPath);
+        } catch (error51) {
+          throw new ClaudeHookInputError(
+            `Could not read the approved Claude plan file: ${errorMessage2(error51)}`
+          );
+        }
+      }
+    }
+    if (inputPlan !== void 0 && inputPlan !== approvedPlan) {
+      throw new ClaudeHookInputError(
+        "PostToolUse plan does not match the approved ExitPlanMode input"
+      );
+    }
+    const planHash = createHash("sha256").update(approvedPlan, "utf8").digest("hex");
+    const approval = await claudeApprovalLocation(payload);
+    if (await claudeApprovalIsAlreadyActive(payload, planHash)) {
+      await removeClaudeCorrelation(approval).catch(() => void 0);
+      return silentSuccess();
+    }
+    await verifyClaudeApproval(
+      approval,
+      payload,
+      planHash,
+      "PostToolUse plan does not match the pre-approved ExitPlanMode input"
+    );
     await approvePlan(approvedPlan, payload.cwd, {
       runtime: "claude",
       sessionId: payload.sessionId
     });
+    await removeClaudeCorrelation(approval).catch(() => void 0);
     return silentSuccess();
   }
   const input = preflightInput(payload);

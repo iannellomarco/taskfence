@@ -74,8 +74,8 @@ flowchart TB
 
 ### Mutation without active approval
 
-- Reads from the explicit read catalog may proceed without a contract.
-- Commands and mutations require active state, a verified checkpoint, bound runtime/session authority, a non-empty call ID, and exact contract authorization.
+- Reads from the explicit read catalog may proceed without a contract. Claude Code's bounded native plan-file write is the sole pre-engine exception: TaskFence defers it to the host's own Plan Mode gate only when the destination resolves safely outside the project, and it grants no project authority.
+- Commands and project mutations require active state, a verified checkpoint, bound runtime/session authority, a non-empty call ID, and exact contract authorization.
 - Unknown tools deny instead of being guessed read-only.
 - Staged, checkpointing, pending, violated, recovery-required, rollback, terminal, and error states deny new commands/mutations.
 

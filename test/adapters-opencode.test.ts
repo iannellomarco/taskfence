@@ -13,6 +13,11 @@ import { approvePlan, getStatus, revokePlan } from "../src/engine.js";
 
 const originalTaskFenceStateDirectory = process.env.TASKFENCE_STATE_DIR;
 const originalXdgStateHome = process.env.XDG_STATE_HOME;
+type OpenCodeAfterHook = NonNullable<Hooks["tool.execute.after"]>;
+type CompatibleAfterHook = (
+  input: Omit<Parameters<OpenCodeAfterHook>[0], "args"> & { args?: unknown },
+  output: Parameters<OpenCodeAfterHook>[1],
+) => Promise<void>;
 
 let temporaryDirectory: string;
 let projectRoot: string;
@@ -63,9 +68,9 @@ function beforeHook(hooks: Hooks): NonNullable<Hooks["tool.execute.before"]> {
   return hooks["tool.execute.before"]!;
 }
 
-function afterHook(hooks: Hooks): NonNullable<Hooks["tool.execute.after"]> {
+function afterHook(hooks: Hooks): CompatibleAfterHook {
   expect(hooks["tool.execute.after"]).toBeTypeOf("function");
-  return hooks["tool.execute.after"]!;
+  return hooks["tool.execute.after"]! as CompatibleAfterHook;
 }
 
 const afterOutput = {
@@ -158,7 +163,7 @@ describe("OpenCode adapter", () => {
     ).rejects.toThrow(/exact plan hash and root/iu);
 
     await expect(before(identity, { args })).resolves.toBeUndefined();
-    await expect(after({ ...identity, args }, afterOutput)).resolves.toBeUndefined();
+    await expect(after(identity, afterOutput)).resolves.toBeUndefined();
     expect(await getStatus(projectRoot)).toMatchObject({
       status: "active",
       contract: { contractHash: approved.contract?.contractHash },
@@ -189,6 +194,26 @@ describe("OpenCode adapter", () => {
       status: "revoked",
       reason: "External user revoked approval",
     });
+  });
+
+  it("detects plan argument mutation when a legacy after hook omits args", async () => {
+    const plan = contractPlan();
+    await approvePlan(plan, projectRoot);
+    const hooks = await loadPlugin();
+    const before = beforeHook(hooks);
+    const after = afterHook(hooks);
+    const identity = {
+      tool: "plan_exit",
+      sessionID: "opencode-session-plan-carrier-change",
+      callID: "opencode-plan-carrier-change-1",
+    };
+    const carrier = { args: { plan } };
+
+    await before(identity, carrier);
+    carrier.args = { plan: `${plan}\n` };
+    await expect(after(identity, afterOutput)).rejects.toThrow(
+      /plan_exit correlation mismatch/iu,
+    );
   });
 
   it("throws on denial and remains silent for an allowed read", async () => {
@@ -233,7 +258,7 @@ describe("OpenCode adapter", () => {
     await expect(before(identity, { args })).resolves.toBeUndefined();
     expect((await getStatus(projectRoot)).status).toBe("mutation_pending");
 
-    await expect(after({ ...identity, args }, afterOutput)).resolves.toBeUndefined();
+    await expect(after(identity, afterOutput)).resolves.toBeUndefined();
     expect((await getStatus(projectRoot)).status).toBe("active");
   });
 
@@ -260,6 +285,28 @@ describe("OpenCode adapter", () => {
         afterOutput,
       ),
     ).rejects.toThrow("TaskFence post-tool correlation mismatch");
+    expect((await getStatus(projectRoot)).status).toBe("mutation_pending");
+  });
+
+  it("detects later plugin mutation when a legacy after hook omits args", async () => {
+    await approvePlan(contractPlan(), projectRoot);
+    const hooks = await loadPlugin();
+    const before = beforeHook(hooks);
+    const after = afterHook(hooks);
+    const identity = {
+      tool: "write",
+      sessionID: "opencode-session-carrier-change",
+      callID: "opencode-write-carrier-change",
+    };
+    const carrier = {
+      args: { path: "tracked.txt", content: "approved\n" },
+    };
+
+    await before(identity, carrier);
+    carrier.args = { path: "outside.txt", content: "substituted\n" };
+    await expect(after(identity, afterOutput)).rejects.toThrow(
+      "TaskFence post-tool correlation mismatch",
+    );
     expect((await getStatus(projectRoot)).status).toBe("mutation_pending");
   });
 
