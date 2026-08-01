@@ -20,6 +20,22 @@ You do not need to write the contract yourself. The included setup skill prepare
   <img src="assets/github-social-preview.svg" alt="TaskFence — deterministic guardrails for coding agents" width="800">
 </p>
 
+## A simple example
+
+Suppose you ask Claude:
+
+> Change the phone number in my website footer. Do not change anything else.
+
+TaskFence turns that request into a narrow set of permissions for this one task. Before work begins, you see and approve something like:
+
+- Claude may edit the footer file.
+- Claude may run the existing website test.
+- Claude may not change any other file or run any other command.
+
+TaskFence then saves a restore point. The expected footer edit is allowed, but an attempt to also update a dependency, delete an image, or change a different page is blocked. When you are happy with the result, you close the task. If something went wrong, you can preview and restore the project to its pre-task state.
+
+You do not need to know the file names in advance or write a contract. The setup skill inspects the project, prepares the exact scope, and shows it to you for approval. TaskFence does not decide whether Claude's work is good; it keeps supported Claude Code tool calls inside the boundaries you approved and gives you a way back.
+
 ## Install in Claude Code
 
 ### What you need
@@ -41,16 +57,20 @@ Run these commands inside Claude Code:
 
 When Claude Code asks for an installation scope, choose **Local** for your first try. That enables TaskFence only for you and only in the current project. Choose **User** later if you want it in every project, or **Project** if your team should share the plugin setting.
 
-### 2. Install the lifecycle CLI
+### 2. Install your finish and recovery controls
 
-The plugin runs its hooks from the bundled artifact. Claude Code's direct `!` shell does not inherit plugin executables on `PATH`, so install the matching CLI once for the user-only status, completion, and rollback commands below:
+The plugin alone is enough to validate plans, save restore points, and keep Claude inside the approved task. The separate `taskfence` command is for actions that only **you** should control: checking status, accepting completed work, withdrawing permission, or restoring a previous state. TaskFence deliberately does not let Claude perform those actions on its own.
+
+Claude Code runs the plugin from an internal versioned folder. That makes the automatic checks work, but your direct shell cannot find the bundled copy when you type `taskfence`. Install the matching command once:
 
 ```text
 !npm install --global https://github.com/iannellomarco/taskfence/archive/refs/tags/v0.1.3.tar.gz
 !taskfence status --root .
 ```
 
-The status command must print a TaskFence state block. The leading `!` runs these as your direct shell commands rather than as Claude tool calls.
+The status command must print a TaskFence state block. The leading `!` means that **you** are running the command through Claude Code's direct shell rather than asking Claude to run it as a tool.
+
+This does not install a second hook or duplicate enforcement. You can briefly explore the plugin without the lifecycle CLI, but install and test it before approving real work so you have a direct completion and recovery path.
 
 ### 3. Give the setup skill a task
 
