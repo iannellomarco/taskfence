@@ -74,7 +74,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "zod": "^4.5.4"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "1.18.13",
